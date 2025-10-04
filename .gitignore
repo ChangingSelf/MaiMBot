@@ -7,6 +7,7 @@ logs/
 out/
 tool_call_benchmark.py
 run_maibot_core.bat
+run_voice.bat
 run_napcat_adapter.bat
 run_ad.bat
 s4u.s4u
@@ -19,6 +20,8 @@ MaiBot-Napcat-Adapter
 nonebot-maibot-adapter/
 MaiMBot-LPMM
 *.zip
+run_bot.bat
+run_na.bat
 run.bat
 log_debug/
 run_amds.bat
@@ -40,10 +43,13 @@ config/bot_config.toml
 config/bot_config.toml.bak
 config/lpmm_config.toml
 config/lpmm_config.toml.bak
+template/compare/bot_config_template.toml
+template/compare/model_config_template.toml
 （测试版）麦麦生成人格.bat
 （临时版）麦麦开始学习.bat
 src/plugins/utils/statistic.py
 CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -314,6 +320,13 @@ run_pet.bat
 /plugins/*
 !/plugins
 !/plugins/hello_world_plugin
+!/plugins/emoji_manage_plugin
 !/plugins/take_picture_plugin
+!/plugins/deep_think
+!/plugins/MaiFrequencyControl
+!/plugins/__init__.py
 
 config.toml
+
+interested_rates.txt
+MaiBot.code-workspace

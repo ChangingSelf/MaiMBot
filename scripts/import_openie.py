@@ -6,13 +6,11 @@
 
 import sys
 import os
+import asyncio
 from time import sleep
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from src.chat.knowledge.lpmmconfig import PG_NAMESPACE, global_config
 from src.chat.knowledge.embedding_store import EmbeddingManager
-from src.chat.knowledge.llm_client import LLMClient
 from src.chat.knowledge.open_ie import OpenIE
 from src.chat.knowledge.kg_manager import KGManager
 from src.common.logger import get_logger
@@ -21,7 +19,7 @@ from src.chat.knowledge.utils.hash import get_sha256
 
 # 添加项目根目录到 sys.path
 ROOT_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-OPENIE_DIR = global_config["persistence"]["openie_data_path"] or os.path.join(ROOT_PATH, "data", "openie")
+OPENIE_DIR = os.path.join(ROOT_PATH, "data", "openie")
 
 logger = get_logger("OpenIE导入")
 
@@ -58,10 +56,14 @@ def hash_deduplicate(
     # 保存去重后的三元组
     new_triple_list_data = {}
 
-    for _, (raw_paragraph, triple_list) in enumerate(zip(raw_paragraphs.values(), triple_list_data.values())):
+    for _, (raw_paragraph, triple_list) in enumerate(
+        zip(raw_paragraphs.values(), triple_list_data.values(), strict=False)
+    ):
         # 段落hash
         paragraph_hash = get_sha256(raw_paragraph)
-        if f"{PG_NAMESPACE}-{paragraph_hash}" in stored_pg_hashes and paragraph_hash in stored_paragraph_hashes:
+        # 使用与EmbeddingStore中一致的命名空间格式：namespace-hash
+        paragraph_key = f"paragraph-{paragraph_hash}"
+        if paragraph_key in stored_pg_hashes and paragraph_hash in stored_paragraph_hashes:
             continue
         new_raw_paragraphs[paragraph_hash] = raw_paragraph
         new_triple_list_data[paragraph_hash] = triple_list
@@ -172,7 +174,7 @@ def handle_import_openie(openie_data: OpenIE, embed_manager: EmbeddingManager, k
     return True
 
 
-def main():  # sourcery skip: dict-comprehension
+async def main_async():  # sourcery skip: dict-comprehension
     # 新增确认提示
     print("=== 重要操作确认 ===")
     print("OpenIE导入时会大量发送请求，可能会撞到请求速度上限，请注意选用的模型")
@@ -191,15 +193,9 @@ def main():  # sourcery skip: dict-comprehension
     logger.info("----开始导入openie数据----\n")
 
     logger.info("创建LLM客户端")
-    llm_client_list = {}
-    for key in global_config["llm_providers"]:
-        llm_client_list[key] = LLMClient(
-            global_config["llm_providers"][key]["base_url"],
-            global_config["llm_providers"][key]["api_key"],
-        )
 
     # 初始化Embedding库
-    embed_manager = EmbeddingManager(llm_client_list[global_config["embedding"]["provider"]])
+    embed_manager = EmbeddingManager()
     logger.info("正在从文件加载Embedding库")
     try:
         embed_manager.load_from_file()
@@ -228,7 +224,8 @@ def main():  # sourcery skip: dict-comprehension
 
     # 数据比对：Embedding库与KG的段落hash集合
     for pg_hash in kg_manager.stored_paragraph_hashes:
-        key = f"{PG_NAMESPACE}-{pg_hash}"
+        # 使用与EmbeddingStore中一致的命名空间格式：namespace-hash
+        key = f"paragraph-{pg_hash}"
         if key not in embed_manager.stored_pg_hashes:
             logger.warning(f"KG中存在Embedding库中不存在的段落：{key}")
 
@@ -242,6 +239,29 @@ def main():  # sourcery skip: dict-comprehension
         logger.error("处理OpenIE数据时发生错误")
         return False
     return None
+
+
+def main():
+    """主函数 - 设置新的事件循环并运行异步主函数"""
+    # 检查是否有现有的事件循环
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_closed():
+            # 如果事件循环已关闭，创建新的
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    except RuntimeError:
+        # 没有运行的事件循环，创建新的
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    try:
+        # 在新的事件循环中运行异步主函数
+        loop.run_until_complete(main_async())
+    finally:
+        # 确保事件循环被正确关闭
+        if not loop.is_closed():
+            loop.close()
 
 
 if __name__ == "__main__":

@@ -21,19 +21,19 @@
 
 import traceback
 import time
-import difflib
-import re
-from typing import Optional, Union
-from src.common.logger import get_logger
+from typing import Optional, Union, Dict, List, TYPE_CHECKING, Tuple
 
-# 导入依赖
-from src.chat.message_receive.chat_stream import get_chat_manager
-from src.chat.focus_chat.heartFC_sender import HeartFCSender
-from src.chat.message_receive.message import MessageSending, MessageRecv
-from src.chat.utils.chat_message_builder import get_raw_msg_before_timestamp_with_chat
-from src.person_info.person_info import get_person_info_manager
-from maim_message import Seg, UserInfo
+from src.common.logger import get_logger
+from src.common.data_models.message_data_model import ReplyContentType
 from src.config.config import global_config
+from src.chat.message_receive.chat_stream import get_chat_manager
+from src.chat.message_receive.uni_message_sender import UniversalMessageSender
+from src.chat.message_receive.message import MessageSending, MessageRecv
+from maim_message import Seg, UserInfo, MessageBase, BaseMessageInfo
+
+if TYPE_CHECKING:
+    from src.common.data_models.database_data_model import DatabaseMessages
+    from src.common.data_models.message_data_model import ReplySetModel, ReplyContent, ForwardNode
 
 logger = get_logger("send_api")
 
@@ -44,29 +44,37 @@ logger = get_logger("send_api")
 
 
 async def _send_to_target(
-    message_type: str,
-    content: Union[str, dict],
+    message_segment: Seg,
     stream_id: str,
     display_message: str = "",
     typing: bool = False,
-    reply_to: str = "",
+    set_reply: bool = False,
+    reply_message: Optional["DatabaseMessages"] = None,
     storage_message: bool = True,
+    show_log: bool = True,
+    selected_expressions: Optional[List[int]] = None,
 ) -> bool:
     """向指定目标发送消息的内部实现
 
     Args:
-        message_type: 消息类型，如"text"、"image"、"emoji"等
-        content: 消息内容
+        message_segment:
         stream_id: 目标流ID
         display_message: 显示消息
-        typing: 是否显示正在输入
-        reply_to: 回复消息的格式，如"发送者:消息内容"
+        typing: 是否模拟打字等待。
+        reply_to: 回复消息，格式为"发送者:消息内容"
+        storage_message: 是否存储消息到数据库
+        show_log: 发送是否显示日志
 
     Returns:
         bool: 是否发送成功
     """
     try:
-        logger.info(f"[SendAPI] 发送{message_type}消息到 {stream_id}")
+        if set_reply and not reply_message:
+            logger.warning("[SendAPI] 使用引用回复，但未提供回复消息")
+            return False
+
+        if show_log:
+            logger.debug(f"[SendAPI] 发送{message_segment.type}消息到 {stream_id}")
 
         # 查找目标聊天流
         target_stream = get_chat_manager().get_stream(stream_id)
@@ -75,7 +83,7 @@ async def _send_to_target(
             return False
 
         # 创建发送器
-        heart_fc_sender = HeartFCSender()
+        message_sender = UniversalMessageSender()
 
         # 生成消息ID
         current_time = time.time()
@@ -88,13 +96,17 @@ async def _send_to_target(
             platform=target_stream.platform,
         )
 
-        # 创建消息段
-        message_segment = Seg(type=message_type, data=content)
-
-        # 处理回复消息
-        anchor_message = None
-        if reply_to:
-            anchor_message = await _find_reply_message(target_stream, reply_to)
+        reply_to_platform_id = ""
+        anchor_message: Union["MessageRecv", None] = None
+        if reply_message:
+            anchor_message = db_message_to_message_recv(reply_message)
+            logger.debug(f"[SendAPI] 找到匹配的回复消息，发送者: {anchor_message.message_info.user_info.user_id}")  # type: ignore
+            if anchor_message:
+                anchor_message.update_chat_stream(target_stream)
+                assert anchor_message.message_info.user_info, "用户信息缺失"
+                reply_to_platform_id = (
+                    f"{anchor_message.message_info.platform}:{anchor_message.message_info.user_info.user_id}"
+                )
 
         # 构建发送消息对象
         bot_message = MessageSending(
@@ -106,17 +118,23 @@ async def _send_to_target(
             display_message=display_message,
             reply=anchor_message,
             is_head=True,
-            is_emoji=(message_type == "emoji"),
+            is_emoji=(message_segment.type == "emoji"),
             thinking_start_time=current_time,
+            reply_to=reply_to_platform_id,
+            selected_expressions=selected_expressions,
         )
 
         # 发送消息
-        sent_msg = await heart_fc_sender.send_message(
-            bot_message, typing=typing, set_reply=(anchor_message is not None), storage_message=storage_message
+        sent_msg = await message_sender.send_message(
+            bot_message,
+            typing=typing,
+            set_reply=set_reply,
+            storage_message=storage_message,
+            show_log=show_log,
         )
 
         if sent_msg:
-            logger.info(f"[SendAPI] 成功发送消息到 {stream_id}")
+            logger.debug(f"[SendAPI] 成功发送消息到 {stream_id}")
             return True
         else:
             logger.error("[SendAPI] 发送消息失败")
@@ -128,140 +146,51 @@ async def _send_to_target(
         return False
 
 
-async def _find_reply_message(target_stream, reply_to: str) -> Optional[MessageRecv]:
-    """查找要回复的消息
-
+def db_message_to_message_recv(message_obj: "DatabaseMessages") -> MessageRecv:
+    """将数据库dict重建为MessageRecv对象
     Args:
-        target_stream: 目标聊天流
-        reply_to: 回复格式，如"发送者:消息内容"或"发送者：消息内容"
+        message_dict: 消息字典
 
     Returns:
         Optional[MessageRecv]: 找到的消息，如果没找到则返回None
     """
-    try:
-        # 解析reply_to参数
-        if ":" in reply_to:
-            parts = reply_to.split(":", 1)
-        elif "：" in reply_to:
-            parts = reply_to.split("：", 1)
-        else:
-            logger.warning(f"[SendAPI] reply_to格式不正确: {reply_to}")
-            return None
+    # 构建MessageRecv对象
+    user_info = {
+        "platform": message_obj.user_info.platform or "",
+        "user_id": message_obj.user_info.user_id or "",
+        "user_nickname": message_obj.user_info.user_nickname or "",
+        "user_cardname": message_obj.user_info.user_cardname or "",
+    }
 
-        if len(parts) != 2:
-            logger.warning(f"[SendAPI] reply_to格式不正确: {reply_to}")
-            return None
-
-        sender = parts[0].strip()
-        text = parts[1].strip()
-
-        # 获取聊天流的最新20条消息
-        reverse_talking_message = get_raw_msg_before_timestamp_with_chat(
-            target_stream.stream_id,
-            time.time(),  # 当前时间之前的消息
-            20,  # 最新的20条消息
-        )
-
-        # 反转列表，使最新的消息在前面
-        reverse_talking_message = list(reversed(reverse_talking_message))
-
-        find_msg = None
-        for message in reverse_talking_message:
-            user_id = message["user_id"]
-            platform = message["chat_info_platform"]
-            person_id = get_person_info_manager().get_person_id(platform, user_id)
-            person_name = await get_person_info_manager().get_value(person_id, "person_name")
-            if person_name == sender:
-                translate_text = message["processed_plain_text"]
-
-                # 检查是否有 回复<aaa:bbb> 字段
-                reply_pattern = r"回复<([^:<>]+):([^:<>]+)>"
-                match = re.search(reply_pattern, translate_text)
-                if match:
-                    aaa = match.group(1)
-                    bbb = match.group(2)
-                    reply_person_id = get_person_info_manager().get_person_id(platform, bbb)
-                    reply_person_name = await get_person_info_manager().get_value(reply_person_id, "person_name")
-                    if not reply_person_name:
-                        reply_person_name = aaa
-                    # 在内容前加上回复信息
-                    translate_text = re.sub(reply_pattern, f"回复 {reply_person_name}", translate_text, count=1)
-
-                # 检查是否有 @<aaa:bbb> 字段
-                at_pattern = r"@<([^:<>]+):([^:<>]+)>"
-                at_matches = list(re.finditer(at_pattern, translate_text))
-                if at_matches:
-                    new_content = ""
-                    last_end = 0
-                    for m in at_matches:
-                        new_content += translate_text[last_end : m.start()]
-                        aaa = m.group(1)
-                        bbb = m.group(2)
-                        at_person_id = get_person_info_manager().get_person_id(platform, bbb)
-                        at_person_name = await get_person_info_manager().get_value(at_person_id, "person_name")
-                        if not at_person_name:
-                            at_person_name = aaa
-                        new_content += f"@{at_person_name}"
-                        last_end = m.end()
-                    new_content += translate_text[last_end:]
-                    translate_text = new_content
-
-                similarity = difflib.SequenceMatcher(None, text, translate_text).ratio()
-                if similarity >= 0.9:
-                    find_msg = message
-                    break
-
-        if not find_msg:
-            logger.info("[SendAPI] 未找到匹配的回复消息")
-            return None
-
-        # 构建MessageRecv对象
-        user_info = {
-            "platform": find_msg.get("user_platform", ""),
-            "user_id": find_msg.get("user_id", ""),
-            "user_nickname": find_msg.get("user_nickname", ""),
-            "user_cardname": find_msg.get("user_cardname", ""),
+    group_info = {}
+    if message_obj.chat_info.group_info:
+        group_info = {
+            "platform": message_obj.chat_info.group_info.group_platform or "",
+            "group_id": message_obj.chat_info.group_info.group_id or "",
+            "group_name": message_obj.chat_info.group_info.group_name or "",
         }
 
-        group_info = {}
-        if find_msg.get("chat_info_group_id"):
-            group_info = {
-                "platform": find_msg.get("chat_info_group_platform", ""),
-                "group_id": find_msg.get("chat_info_group_id", ""),
-                "group_name": find_msg.get("chat_info_group_name", ""),
-            }
+    format_info = {"content_format": "", "accept_format": ""}
+    template_info = {"template_items": {}}
 
-        format_info = {"content_format": "", "accept_format": ""}
-        template_info = {"template_items": {}}
+    message_info = {
+        "platform": message_obj.chat_info.platform or "",
+        "message_id": message_obj.message_id,
+        "time": message_obj.time,
+        "group_info": group_info,
+        "user_info": user_info,
+        "additional_config": message_obj.additional_config,
+        "format_info": format_info,
+        "template_info": template_info,
+    }
 
-        message_info = {
-            "platform": target_stream.platform,
-            "message_id": find_msg.get("message_id"),
-            "time": find_msg.get("time"),
-            "group_info": group_info,
-            "user_info": user_info,
-            "additional_config": find_msg.get("additional_config"),
-            "format_info": format_info,
-            "template_info": template_info,
-        }
+    message_dict_recv = {
+        "message_info": message_info,
+        "raw_message": message_obj.processed_plain_text,
+        "processed_plain_text": message_obj.processed_plain_text,
+    }
 
-        message_dict = {
-            "message_info": message_info,
-            "raw_message": find_msg.get("processed_plain_text"),
-            "detailed_plain_text": find_msg.get("processed_plain_text"),
-            "processed_plain_text": find_msg.get("processed_plain_text"),
-        }
-
-        find_rec_msg = MessageRecv(message_dict)
-        find_rec_msg.update_chat_stream(target_stream)
-
-        logger.info(f"[SendAPI] 找到匹配的回复消息，发送者: {sender}")
-        return find_rec_msg
-
-    except Exception as e:
-        logger.error(f"[SendAPI] 查找回复消息时出错: {e}")
-        traceback.print_exc()
-        return None
+    return MessageRecv(message_dict_recv)
 
 
 # =============================================================================
@@ -273,8 +202,10 @@ async def text_to_stream(
     text: str,
     stream_id: str,
     typing: bool = False,
-    reply_to: str = "",
+    set_reply: bool = False,
+    reply_message: Optional["DatabaseMessages"] = None,
     storage_message: bool = True,
+    selected_expressions: Optional[List[int]] = None,
 ) -> bool:
     """向指定流发送文本消息
 
@@ -288,10 +219,25 @@ async def text_to_stream(
     Returns:
         bool: 是否发送成功
     """
-    return await _send_to_target("text", text, stream_id, "", typing, reply_to, storage_message)
+    return await _send_to_target(
+        message_segment=Seg(type="text", data=text),
+        stream_id=stream_id,
+        display_message="",
+        typing=typing,
+        set_reply=set_reply,
+        reply_message=reply_message,
+        storage_message=storage_message,
+        selected_expressions=selected_expressions,
+    )
 
 
-async def emoji_to_stream(emoji_base64: str, stream_id: str, storage_message: bool = True) -> bool:
+async def emoji_to_stream(
+    emoji_base64: str,
+    stream_id: str,
+    storage_message: bool = True,
+    set_reply: bool = False,
+    reply_message: Optional["DatabaseMessages"] = None,
+) -> bool:
     """向指定流发送表情包
 
     Args:
@@ -302,10 +248,24 @@ async def emoji_to_stream(emoji_base64: str, stream_id: str, storage_message: bo
     Returns:
         bool: 是否发送成功
     """
-    return await _send_to_target("emoji", emoji_base64, stream_id, "", typing=False, storage_message=storage_message)
+    return await _send_to_target(
+        message_segment=Seg(type="emoji", data=emoji_base64),
+        stream_id=stream_id,
+        display_message="",
+        typing=False,
+        storage_message=storage_message,
+        set_reply=set_reply,
+        reply_message=reply_message,
+    )
 
 
-async def image_to_stream(image_base64: str, stream_id: str, storage_message: bool = True) -> bool:
+async def image_to_stream(
+    image_base64: str,
+    stream_id: str,
+    storage_message: bool = True,
+    set_reply: bool = False,
+    reply_message: Optional["DatabaseMessages"] = None,
+) -> bool:
     """向指定流发送图片
 
     Args:
@@ -316,11 +276,22 @@ async def image_to_stream(image_base64: str, stream_id: str, storage_message: bo
     Returns:
         bool: 是否发送成功
     """
-    return await _send_to_target("image", image_base64, stream_id, "", typing=False, storage_message=storage_message)
+    return await _send_to_target(
+        message_segment=Seg(type="image", data=image_base64),
+        stream_id=stream_id,
+        display_message="",
+        typing=False,
+        storage_message=storage_message,
+        set_reply=set_reply,
+        reply_message=reply_message,
+    )
 
 
 async def command_to_stream(
-    command: Union[str, dict], stream_id: str, storage_message: bool = True, display_message: str = ""
+    command: Union[str, dict],
+    stream_id: str,
+    storage_message: bool = True,
+    display_message: str = "",
 ) -> bool:
     """向指定流发送命令
 
@@ -328,23 +299,31 @@ async def command_to_stream(
         command: 命令
         stream_id: 聊天流ID
         storage_message: 是否存储消息到数据库
+        display_message: 显示消息
 
     Returns:
         bool: 是否发送成功
     """
     return await _send_to_target(
-        "command", command, stream_id, display_message, typing=False, storage_message=storage_message
+        message_segment=Seg(type="command", data=command),  # type: ignore
+        stream_id=stream_id,
+        display_message=display_message,
+        typing=False,
+        storage_message=storage_message,
+        set_reply=False,
     )
 
 
 async def custom_to_stream(
     message_type: str,
-    content: str,
+    content: str | Dict,
     stream_id: str,
     display_message: str = "",
     typing: bool = False,
-    reply_to: str = "",
+    reply_message: Optional["DatabaseMessages"] = None,
+    set_reply: bool = False,
     storage_message: bool = True,
+    show_log: bool = True,
 ) -> bool:
     """向指定流发送自定义类型消息
 
@@ -356,248 +335,127 @@ async def custom_to_stream(
         typing: 是否显示正在输入
         reply_to: 回复消息，格式为"发送者:消息内容"
         storage_message: 是否存储消息到数据库
-
+        show_log: 是否显示日志
     Returns:
         bool: 是否发送成功
     """
-    return await _send_to_target(message_type, content, stream_id, display_message, typing, reply_to, storage_message)
+    return await _send_to_target(
+        message_segment=Seg(type=message_type, data=content),  # type: ignore
+        stream_id=stream_id,
+        display_message=display_message,
+        typing=typing,
+        reply_message=reply_message,
+        set_reply=set_reply,
+        storage_message=storage_message,
+        show_log=show_log,
+    )
 
 
-async def text_to_group(
-    text: str,
-    group_id: str,
-    platform: str = "qq",
+async def custom_reply_set_to_stream(
+    reply_set: "ReplySetModel",
+    stream_id: str,
+    display_message: str = "",  # 基本没用
     typing: bool = False,
-    reply_to: str = "",
+    reply_message: Optional["DatabaseMessages"] = None,
+    set_reply: bool = False,
     storage_message: bool = True,
+    show_log: bool = True,
 ) -> bool:
-    """向群聊发送文本消息
-
-    Args:
-        text: 要发送的文本内容
-        group_id: 群聊ID
-        platform: 平台，默认为"qq"
-        typing: 是否显示正在输入
-        reply_to: 回复消息，格式为"发送者:消息内容"
-
-    Returns:
-        bool: 是否发送成功
     """
-    stream_id = get_chat_manager().get_stream_id(platform, group_id, True)
-
-    return await _send_to_target("text", text, stream_id, "", typing, reply_to, storage_message)
-
-
-async def text_to_user(
-    text: str,
-    user_id: str,
-    platform: str = "qq",
-    typing: bool = False,
-    reply_to: str = "",
-    storage_message: bool = True,
-) -> bool:
-    """向用户发送私聊文本消息
+    向指定流发送混合型消息集
 
     Args:
-        text: 要发送的文本内容
-        user_id: 用户ID
-        platform: 平台，默认为"qq"
-        typing: 是否显示正在输入
-        reply_to: 回复消息，格式为"发送者:消息内容"
-
-    Returns:
-        bool: 是否发送成功
-    """
-    stream_id = get_chat_manager().get_stream_id(platform, user_id, False)
-    return await _send_to_target("text", text, stream_id, "", typing, reply_to, storage_message)
-
-
-async def emoji_to_group(emoji_base64: str, group_id: str, platform: str = "qq", storage_message: bool = True) -> bool:
-    """向群聊发送表情包
-
-    Args:
-        emoji_base64: 表情包的base64编码
-        group_id: 群聊ID
-        platform: 平台，默认为"qq"
-
-    Returns:
-        bool: 是否发送成功
-    """
-    stream_id = get_chat_manager().get_stream_id(platform, group_id, True)
-    return await _send_to_target("emoji", emoji_base64, stream_id, "", typing=False, storage_message=storage_message)
-
-
-async def emoji_to_user(emoji_base64: str, user_id: str, platform: str = "qq", storage_message: bool = True) -> bool:
-    """向用户发送表情包
-
-    Args:
-        emoji_base64: 表情包的base64编码
-        user_id: 用户ID
-        platform: 平台，默认为"qq"
-
-    Returns:
-        bool: 是否发送成功
-    """
-    stream_id = get_chat_manager().get_stream_id(platform, user_id, False)
-    return await _send_to_target("emoji", emoji_base64, stream_id, "", typing=False, storage_message=storage_message)
-
-
-async def image_to_group(image_base64: str, group_id: str, platform: str = "qq", storage_message: bool = True) -> bool:
-    """向群聊发送图片
-
-    Args:
-        image_base64: 图片的base64编码
-        group_id: 群聊ID
-        platform: 平台，默认为"qq"
-
-    Returns:
-        bool: 是否发送成功
-    """
-    stream_id = get_chat_manager().get_stream_id(platform, group_id, True)
-    return await _send_to_target("image", image_base64, stream_id, "", typing=False, storage_message=storage_message)
-
-
-async def image_to_user(image_base64: str, user_id: str, platform: str = "qq", storage_message: bool = True) -> bool:
-    """向用户发送图片
-
-    Args:
-        image_base64: 图片的base64编码
-        user_id: 用户ID
-        platform: 平台，默认为"qq"
-
-    Returns:
-        bool: 是否发送成功
-    """
-    stream_id = get_chat_manager().get_stream_id(platform, user_id, False)
-    return await _send_to_target("image", image_base64, stream_id, "", typing=False)
-
-
-async def command_to_group(command: str, group_id: str, platform: str = "qq", storage_message: bool = True) -> bool:
-    """向群聊发送命令
-
-    Args:
-        command: 命令
-        group_id: 群聊ID
-        platform: 平台，默认为"qq"
-
-    Returns:
-        bool: 是否发送成功
-    """
-    stream_id = get_chat_manager().get_stream_id(platform, group_id, True)
-    return await _send_to_target("command", command, stream_id, "", typing=False, storage_message=storage_message)
-
-
-async def command_to_user(command: str, user_id: str, platform: str = "qq", storage_message: bool = True) -> bool:
-    """向用户发送命令
-
-    Args:
-        command: 命令
-        user_id: 用户ID
-        platform: 平台，默认为"qq"
-
-    Returns:
-        bool: 是否发送成功
-    """
-    stream_id = get_chat_manager().get_stream_id(platform, user_id, False)
-    return await _send_to_target("command", command, stream_id, "", typing=False, storage_message=storage_message)
-
-
-# =============================================================================
-# 通用发送函数 - 支持任意消息类型
-# =============================================================================
-
-
-async def custom_to_group(
-    message_type: str,
-    content: str,
-    group_id: str,
-    platform: str = "qq",
-    display_message: str = "",
-    typing: bool = False,
-    reply_to: str = "",
-    storage_message: bool = True,
-) -> bool:
-    """向群聊发送自定义类型消息
-
-    Args:
-        message_type: 消息类型，如"text"、"image"、"emoji"、"video"、"file"等
-        content: 消息内容（通常是base64编码或文本）
-        group_id: 群聊ID
-        platform: 平台，默认为"qq"
+        reply_set: ReplySetModel 对象，包含多个 ReplyContent
+        stream_id: 聊天流ID
         display_message: 显示消息
         typing: 是否显示正在输入
         reply_to: 回复消息，格式为"发送者:消息内容"
-
-    Returns:
-        bool: 是否发送成功
+        storage_message: 是否存储消息到数据库
+        show_log: 是否显示日志
     """
-    stream_id = get_chat_manager().get_stream_id(platform, group_id, True)
-    return await _send_to_target(message_type, content, stream_id, display_message, typing, reply_to, storage_message)
+    flag: bool = True
+    for reply_content in reply_set.reply_data:
+        status: bool = False
+        message_seg, need_typing = _parse_content_to_seg(reply_content)
+        status = await _send_to_target(
+            message_segment=message_seg,
+            stream_id=stream_id,
+            display_message=display_message,
+            typing=bool(need_typing and typing),
+            reply_message=reply_message,
+            set_reply=set_reply,
+            storage_message=storage_message,
+            show_log=show_log,
+        )
+        if not status:
+            flag = False
+            logger.error(
+                f"[SendAPI] 发送{repr(reply_content.content_type)}消息失败，消息内容：{str(reply_content.content)[:100]}"
+            )
+
+    return flag
 
 
-async def custom_to_user(
-    message_type: str,
-    content: str,
-    user_id: str,
-    platform: str = "qq",
-    display_message: str = "",
-    typing: bool = False,
-    reply_to: str = "",
-    storage_message: bool = True,
-) -> bool:
-    """向用户发送自定义类型消息
-
+def _parse_content_to_seg(reply_content: "ReplyContent") -> Tuple[Seg, bool]:
+    """
+    把 ReplyContent 转换为 Seg 结构 (Forward 中仅递归一次)
     Args:
-        message_type: 消息类型，如"text"、"image"、"emoji"、"video"、"file"等
-        content: 消息内容（通常是base64编码或文本）
-        user_id: 用户ID
-        platform: 平台，默认为"qq"
-        display_message: 显示消息
-        typing: 是否显示正在输入
-        reply_to: 回复消息，格式为"发送者:消息内容"
-
+        reply_content: ReplyContent 对象
     Returns:
-        bool: 是否发送成功
+        Tuple[Seg, bool]: 转换后的 Seg 结构和是否需要typing的标志
     """
-    stream_id = get_chat_manager().get_stream_id(platform, user_id, False)
-    return await _send_to_target(message_type, content, stream_id, display_message, typing, reply_to, storage_message)
+    content_type = reply_content.content_type
+    if content_type == ReplyContentType.TEXT:
+        text_data: str = reply_content.content  # type: ignore
+        return Seg(type="text", data=text_data), True
+    elif content_type == ReplyContentType.IMAGE:
+        return Seg(type="image", data=reply_content.content), False  # type: ignore
+    elif content_type == ReplyContentType.EMOJI:
+        return Seg(type="emoji", data=reply_content.content), False  # type: ignore
+    elif content_type == ReplyContentType.COMMAND:
+        return Seg(type="command", data=reply_content.content), False  # type: ignore
+    elif content_type == ReplyContentType.VOICE:
+        return Seg(type="voice", data=reply_content.content), False  # type: ignore
+    elif content_type == ReplyContentType.HYBRID:
+        hybrid_message_list_data: List[ReplyContent] = reply_content.content  # type: ignore
+        assert isinstance(hybrid_message_list_data, list), "混合类型内容必须是列表"
+        sub_seg_list: List[Seg] = []
+        for sub_content in hybrid_message_list_data:
+            sub_content_type = sub_content.content_type
+            sub_content_data = sub_content.content
 
-
-async def custom_message(
-    message_type: str,
-    content: str,
-    target_id: str,
-    is_group: bool = True,
-    platform: str = "qq",
-    display_message: str = "",
-    typing: bool = False,
-    reply_to: str = "",
-    storage_message: bool = True,
-) -> bool:
-    """发送自定义消息的通用接口
-
-    Args:
-        message_type: 消息类型，如"text"、"image"、"emoji"、"video"、"file"、"audio"等
-        content: 消息内容
-        target_id: 目标ID（群ID或用户ID）
-        is_group: 是否为群聊，True为群聊，False为私聊
-        platform: 平台，默认为"qq"
-        display_message: 显示消息
-        typing: 是否显示正在输入
-        reply_to: 回复消息，格式为"发送者:消息内容"
-
-    Returns:
-        bool: 是否发送成功
-
-    示例:
-        # 发送视频到群聊
-        await send_api.custom_message("video", video_base64, "123456", True)
-
-        # 发送文件到用户
-        await send_api.custom_message("file", file_base64, "987654", False)
-
-        # 发送音频到群聊并回复特定消息
-        await send_api.custom_message("audio", audio_base64, "123456", True, reply_to="张三:你好")
-    """
-    stream_id = get_chat_manager().get_stream_id(platform, target_id, is_group)
-    return await _send_to_target(message_type, content, stream_id, display_message, typing, reply_to, storage_message)
+            if sub_content_type == ReplyContentType.TEXT:
+                sub_seg_list.append(Seg(type="text", data=sub_content_data))  # type: ignore
+            elif sub_content_type == ReplyContentType.IMAGE:
+                sub_seg_list.append(Seg(type="image", data=sub_content_data))  # type: ignore
+            elif sub_content_type == ReplyContentType.EMOJI:
+                sub_seg_list.append(Seg(type="emoji", data=sub_content_data))  # type: ignore
+            else:
+                logger.warning(f"[SendAPI] 混合类型中不支持的子内容类型: {repr(sub_content_type)}")
+                continue
+        return Seg(type="seglist", data=sub_seg_list), True
+    elif content_type == ReplyContentType.FORWARD:
+        forward_message_list_data: List["ForwardNode"] = reply_content.content  # type: ignore
+        assert isinstance(forward_message_list_data, list), "转发类型内容必须是列表"
+        forward_message_list: List[Dict] = []
+        for forward_node in forward_message_list_data:
+            message_segment = Seg(type="id", data=forward_node.content)  # type: ignore
+            user_info: Optional[UserInfo] = None
+            if forward_node.user_id and forward_node.user_nickname:
+                assert isinstance(forward_node.content, list), "转发节点内容必须是列表"
+                user_info = UserInfo(user_id=forward_node.user_id, user_nickname=forward_node.user_nickname)
+                single_node_content: List[Seg] = []
+                for sub_content in forward_node.content:
+                    if sub_content.content_type != ReplyContentType.FORWARD:
+                        sub_seg, _ = _parse_content_to_seg(sub_content)
+                        single_node_content.append(sub_seg)
+                message_segment = Seg(type="seglist", data=single_node_content)
+            forward_message_list.append(
+                MessageBase(
+                    message_segment=message_segment, message_info=BaseMessageInfo(user_info=user_info)
+                ).to_dict()
+            )
+        return Seg(type="forward", data=forward_message_list), False  # type: ignore
+    else:
+        message_type_in_str = content_type.value if isinstance(content_type, ReplyContentType) else str(content_type)
+        return Seg(type=message_type_in_str, data=reply_content.content), True  # type: ignore

@@ -8,7 +8,9 @@
 """
 
 import traceback
-from typing import Dict, List, Any, Union, Type
+import time
+import json
+from typing import Dict, List, Any, Union, Type, Optional
 from src.common.logger import get_logger
 from peewee import Model, DoesNotExist
 
@@ -21,12 +23,12 @@ logger = get_logger("database_api")
 
 async def db_query(
     model_class: Type[Model],
-    query_type: str = "get",
-    filters: Dict[str, Any] = None,
-    data: Dict[str, Any] = None,
-    limit: int = None,
-    order_by: List[str] = None,
-    single_result: bool = False,
+    data: Optional[Dict[str, Any]] = None,
+    query_type: Optional[str] = "get",
+    filters: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = None,
+    order_by: Optional[List[str]] = None,
+    single_result: Optional[bool] = False,
 ) -> Union[List[Dict[str, Any]], Dict[str, Any], None]:
     """执行数据库查询操作
 
@@ -34,11 +36,11 @@ async def db_query(
 
     Args:
         model_class: Peewee 模型类，例如 ActionRecords, Messages 等
+        data: 用于创建或更新的数据字典
         query_type: 查询类型，可选值: "get", "create", "update", "delete", "count"
         filters: 过滤条件字典，键为字段名，值为要匹配的值
-        data: 用于创建或更新的数据字典
         limit: 限制结果数量
-        order_by: 排序字段列表，使用字段名，前缀'-'表示降序
+        order_by: 排序字段，前缀'-'表示降序，例如'-time'表示按时间字段（即time字段）降序
         single_result: 是否只返回单个结果
 
     Returns:
@@ -48,7 +50,8 @@ async def db_query(
         - "update": 返回受影响的行数
         - "delete": 返回受影响的行数
         - "count": 返回记录数量
-
+    """
+    """
     示例:
         # 查询最近10条消息
         messages = await database_api.db_query(
@@ -62,16 +65,16 @@ async def db_query(
         # 创建一条记录
         new_record = await database_api.db_query(
             ActionRecords,
+            data={"action_id": "123", "time": time.time(), "action_name": "TestAction"},
             query_type="create",
-            data={"action_id": "123", "time": time.time(), "action_name": "TestAction"}
         )
 
         # 更新记录
         updated_count = await database_api.db_query(
             ActionRecords,
+            data={"action_done": True},
             query_type="update",
             filters={"action_id": "123"},
-            data={"action_done": True}
         )
 
         # 删除记录
@@ -129,7 +132,7 @@ async def db_query(
             # 创建记录
             record = model_class.create(**data)
             # 返回创建的记录
-            return model_class.select().where(model_class.id == record.id).dicts().get()
+            return model_class.select().where(model_class.id == record.id).dicts().get()  # type: ignore
 
         elif query_type == "update":
             if not data:
@@ -151,10 +154,7 @@ async def db_query(
 
     except DoesNotExist:
         # 记录不存在
-        if query_type == "get" and single_result:
-            return None
-        return []
-
+        return None if query_type == "get" and single_result else []
     except Exception as e:
         logger.error(f"[DatabaseAPI] 数据库操作出错: {e}")
         traceback.print_exc()
@@ -168,8 +168,9 @@ async def db_query(
 
 
 async def db_save(
-    model_class: Type[Model], data: Dict[str, Any], key_field: str = None, key_value: Any = None
-) -> Union[Dict[str, Any], None]:
+    model_class: Type[Model], data: Dict[str, Any], key_field: Optional[str] = None, key_value: Optional[Any] = None
+) -> Optional[Dict[str, Any]]:
+    # sourcery skip: inline-immediately-returned-variable
     """保存数据到数据库（创建或更新）
 
     如果提供了key_field和key_value，会先尝试查找匹配的记录进行更新；
@@ -202,10 +203,9 @@ async def db_save(
     try:
         # 如果提供了key_field和key_value，尝试更新现有记录
         if key_field and key_value is not None:
-            # 查找现有记录
-            existing_records = list(model_class.select().where(getattr(model_class, key_field) == key_value).limit(1))
-
-            if existing_records:
+            if existing_records := list(
+                model_class.select().where(getattr(model_class, key_field) == key_value).limit(1)
+            ):
                 # 更新现有记录
                 existing_record = existing_records[0]
                 for field, value in data.items():
@@ -213,14 +213,14 @@ async def db_save(
                 existing_record.save()
 
                 # 返回更新后的记录
-                updated_record = model_class.select().where(model_class.id == existing_record.id).dicts().get()
+                updated_record = model_class.select().where(model_class.id == existing_record.id).dicts().get()  # type: ignore
                 return updated_record
 
         # 如果没有找到现有记录或未提供key_field和key_value，创建新记录
         new_record = model_class.create(**data)
 
         # 返回创建的记录
-        created_record = model_class.select().where(model_class.id == new_record.id).dicts().get()
+        created_record = model_class.select().where(model_class.id == new_record.id).dicts().get()  # type: ignore
         return created_record
 
     except Exception as e:
@@ -230,7 +230,11 @@ async def db_save(
 
 
 async def db_get(
-    model_class: Type[Model], filters: Dict[str, Any] = None, order_by: str = None, limit: int = None
+    model_class: Type[Model],
+    filters: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = None,
+    order_by: Optional[str] = None,
+    single_result: Optional[bool] = False,
 ) -> Union[List[Dict[str, Any]], Dict[str, Any], None]:
     """从数据库获取记录
 
@@ -239,11 +243,12 @@ async def db_get(
     Args:
         model_class: Peewee模型类
         filters: 过滤条件，字段名和值的字典
-        order_by: 排序字段，前缀'-'表示降序，例如'-time'表示按时间降序
-        limit: 结果数量限制，如果为1则返回单个记录而不是列表
+        limit: 结果数量限制
+        order_by: 排序字段，前缀'-'表示降序，例如'-time'表示按时间字段（即time字段）降序
+        single_result: 是否只返回单个结果，如果为True，则返回单个记录字典或None；否则返回记录字典列表或空列表
 
     Returns:
-        如果limit=1，返回单个记录字典或None；
+        如果single_result为True，返回单个记录字典或None；
         否则返回记录字典列表或空列表。
 
     示例:
@@ -258,8 +263,8 @@ async def db_get(
         records = await database_api.db_get(
             Messages,
             filters={"chat_id": chat_stream.stream_id},
+            limit=10,
             order_by="-time",
-            limit=10
         )
     """
     try:
@@ -286,14 +291,14 @@ async def db_get(
         results = list(query.dicts())
 
         # 返回结果
-        if limit == 1:
+        if single_result:
             return results[0] if results else None
         return results
 
     except Exception as e:
         logger.error(f"[DatabaseAPI] 获取数据库记录出错: {e}")
         traceback.print_exc()
-        return None if limit == 1 else []
+        return None if single_result else []
 
 
 async def store_action_info(
@@ -302,9 +307,10 @@ async def store_action_info(
     action_prompt_display: str = "",
     action_done: bool = True,
     thinking_id: str = "",
-    action_data: dict = None,
+    action_data: Optional[dict] = None,
     action_name: str = "",
-) -> Union[Dict[str, Any], None]:
+    action_reasoning: str = "",
+) -> Optional[Dict[str, Any]]:
     """存储动作信息到数据库
 
     将Action执行的相关信息保存到ActionRecords表中，用于后续的记忆和上下文构建。
@@ -317,7 +323,7 @@ async def store_action_info(
         thinking_id: 关联的思考ID
         action_data: 动作数据字典
         action_name: 动作名称
-
+        action_reasoning: 动作执行理由
     Returns:
         Dict[str, Any]: 保存的记录数据
         None: 如果保存失败
@@ -334,8 +340,6 @@ async def store_action_info(
         )
     """
     try:
-        import time
-        import json
         from src.common.database.database_model import ActionRecords
 
         # 构建动作记录数据
@@ -345,6 +349,7 @@ async def store_action_info(
             "action_name": action_name,
             "action_data": json.dumps(action_data or {}, ensure_ascii=False),
             "action_done": action_done,
+            "action_reasoning": action_reasoning,
             "action_build_into_prompt": action_build_into_prompt,
             "action_prompt_display": action_prompt_display,
         }
@@ -374,7 +379,7 @@ async def store_action_info(
         )
 
         if saved_record:
-            logger.info(f"[DatabaseAPI] 成功存储动作信息: {action_name} (ID: {record_data['action_id']})")
+            logger.debug(f"[DatabaseAPI] 成功存储动作信息: {action_name} (ID: {record_data['action_id']})")
         else:
             logger.error(f"[DatabaseAPI] 存储动作信息失败: {action_name}")
 

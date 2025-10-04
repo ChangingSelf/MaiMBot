@@ -1,9 +1,13 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, TYPE_CHECKING, List
 from src.common.logger import get_logger
+from src.common.data_models.message_data_model import ReplyContentType, ReplyContent, ReplySetModel, ForwardNode
 from src.plugin_system.base.component_types import CommandInfo, ComponentType
 from src.chat.message_receive.message import MessageRecv
 from src.plugin_system.apis import send_api
+
+if TYPE_CHECKING:
+    from src.common.data_models.database_data_model import DatabaseMessages
 
 logger = get_logger("base_command")
 
@@ -17,19 +21,17 @@ class BaseCommand(ABC):
     - command_pattern: 命令匹配的正则表达式
     - command_help: 命令帮助信息
     - command_examples: 命令使用示例列表
-    - intercept_message: 是否拦截消息处理（默认True拦截，False继续传递）
     """
 
     command_name: str = ""
+    """Command组件的名称"""
     command_description: str = ""
+    """Command组件的描述"""
+    # 默认命令设置
+    command_pattern: str = r""
+    """命令匹配的正则表达式"""
 
-    # 默认命令设置（子类可以覆盖）
-    command_pattern: str = ""
-    command_help: str = ""
-    command_examples: List[str] = []
-    intercept_message: bool = True  # 默认拦截消息，不继续处理
-
-    def __init__(self, message: MessageRecv, plugin_config: dict = None):
+    def __init__(self, message: MessageRecv, plugin_config: Optional[dict] = None):
         """初始化Command组件
 
         Args:
@@ -53,19 +55,19 @@ class BaseCommand(ABC):
         self.matched_groups = groups
 
     @abstractmethod
-    async def execute(self) -> Tuple[bool, Optional[str]]:
+    async def execute(self) -> Tuple[bool, Optional[str], bool]:
         """执行Command的抽象方法，子类必须实现
 
         Returns:
-            Tuple[bool, Optional[str]]: (是否执行成功, 可选的回复消息)
+            Tuple[bool, Optional[str], bool]: (是否执行成功, 可选的回复消息, 是否拦截消息 不进行 后续处理)
         """
         pass
 
     def get_config(self, key: str, default=None):
-        """获取插件配置值，支持嵌套键访问
+        """获取插件配置值，使用嵌套键访问
 
         Args:
-            key: 配置键名，支持嵌套访问如 "section.subsection.key"
+            key: 配置键名，使用嵌套访问如 "section.subsection.key"
             default: 默认值
 
         Returns:
@@ -86,12 +88,20 @@ class BaseCommand(ABC):
 
         return current
 
-    async def send_text(self, content: str, reply_to: str = "") -> bool:
+    async def send_text(
+        self,
+        content: str,
+        set_reply: bool = False,
+        reply_message: Optional["DatabaseMessages"] = None,
+        storage_message: bool = True,
+    ) -> bool:
         """发送回复消息
 
         Args:
             content: 回复内容
-            reply_to: 回复消息，格式为"发送者:消息内容"
+            set_reply: 是否作为回复发送
+            reply_message: 回复的消息对象（当set_reply为True时必填）
+            storage_message: 是否存储消息到数据库
 
         Returns:
             bool: 是否发送成功
@@ -102,40 +112,75 @@ class BaseCommand(ABC):
             logger.error(f"{self.log_prefix} 缺少聊天流或stream_id")
             return False
 
-        return await send_api.text_to_stream(text=content, stream_id=chat_stream.stream_id, reply_to=reply_to)
+        return await send_api.text_to_stream(
+            text=content,
+            stream_id=chat_stream.stream_id,
+            set_reply=set_reply,
+            reply_message=reply_message,
+            storage_message=storage_message,
+        )
 
-    async def send_type(
-        self, message_type: str, content: str, display_message: str = "", typing: bool = False, reply_to: str = ""
+    async def send_image(
+        self,
+        image_base64: str,
+        set_reply: bool = False,
+        reply_message: Optional["DatabaseMessages"] = None,
+        storage_message: bool = True,
     ) -> bool:
-        """发送指定类型的回复消息到当前聊天环境
+        """发送图片
 
         Args:
-            message_type: 消息类型，如"text"、"image"、"emoji"等
-            content: 消息内容
-            display_message: 显示消息（可选）
-            typing: 是否显示正在输入
-            reply_to: 回复消息，格式为"发送者:消息内容"
+            image_base64: 图片的base64编码
 
         Returns:
             bool: 是否发送成功
         """
-        # 获取聊天流信息
         chat_stream = self.message.chat_stream
         if not chat_stream or not hasattr(chat_stream, "stream_id"):
             logger.error(f"{self.log_prefix} 缺少聊天流或stream_id")
             return False
 
-        return await send_api.custom_to_stream(
-            message_type=message_type,
-            content=content,
-            stream_id=chat_stream.stream_id,
-            display_message=display_message,
-            typing=typing,
-            reply_to=reply_to,
+        return await send_api.image_to_stream(
+            image_base64,
+            chat_stream.stream_id,
+            set_reply=set_reply,
+            reply_message=reply_message,
+            storage_message=storage_message,
+        )
+
+    async def send_emoji(
+        self,
+        emoji_base64: str,
+        set_reply: bool = False,
+        reply_message: Optional["DatabaseMessages"] = None,
+        storage_message: bool = True,
+    ) -> bool:
+        """发送表情包
+
+        Args:
+            emoji_base64: 表情包的base64编码
+            set_reply: 是否作为回复发送
+            reply_message: 回复的消息对象（当set_reply为True时必填）
+            storage_message: 是否存储消息到数据库
+
+        Returns:
+            bool: 是否发送成功
+        """
+        chat_stream = self.message.chat_stream
+        if not chat_stream or not hasattr(chat_stream, "stream_id"):
+            logger.error(f"{self.log_prefix} 缺少聊天流或stream_id")
+            return False
+
+        return await send_api.emoji_to_stream(
+            emoji_base64, chat_stream.stream_id, set_reply=set_reply, reply_message=reply_message
         )
 
     async def send_command(
-        self, command_name: str, args: dict = None, display_message: str = "", storage_message: bool = True
+        self,
+        command_name: str,
+        args: Optional[dict] = None,
+        display_message: str = "",
+        storage_message: bool = True,
     ) -> bool:
         """发送命令消息
 
@@ -176,12 +221,11 @@ class BaseCommand(ABC):
             logger.error(f"{self.log_prefix} 发送命令时出错: {e}")
             return False
 
-    async def send_emoji(self, emoji_base64: str) -> bool:
-        """发送表情包
-
+    async def send_voice(self, voice_base64: str) -> bool:
+        """
+        发送语音消息
         Args:
-            emoji_base64: 表情包的base64编码
-
+            voice_base64: 语音的base64编码
         Returns:
             bool: 是否发送成功
         """
@@ -190,13 +234,61 @@ class BaseCommand(ABC):
             logger.error(f"{self.log_prefix} 缺少聊天流或stream_id")
             return False
 
-        return await send_api.emoji_to_stream(emoji_base64, chat_stream.stream_id)
+        return await send_api.custom_to_stream(
+            message_type="voice",
+            content=voice_base64,
+            stream_id=chat_stream.stream_id,
+            typing=False,
+            set_reply=False,
+            reply_message=None,
+            storage_message=False,
+        )
 
-    async def send_image(self, image_base64: str) -> bool:
-        """发送图片
+    async def send_hybrid(
+        self,
+        message_tuple_list: List[Tuple[ReplyContentType | str, str]],
+        typing: bool = False,
+        set_reply: bool = False,
+        reply_message: Optional["DatabaseMessages"] = None,
+        storage_message: bool = True,
+    ) -> bool:
+        """
+        发送混合类型消息
 
         Args:
-            image_base64: 图片的base64编码
+            message_tuple_list: 包含消息类型和内容的元组列表，格式为 [(内容类型, 内容), ...]
+            typing: 是否显示正在输入
+            set_reply: 是否计算打字时间
+            reply_message: 回复的消息对象
+            storage_message: 是否存储消息到数据库
+        """
+        chat_stream = self.message.chat_stream
+        if not chat_stream or not hasattr(chat_stream, "stream_id"):
+            logger.error(f"{self.log_prefix} 缺少聊天流或stream_id")
+            return False
+        reply_set = ReplySetModel()
+        reply_set.add_hybrid_content_by_raw(message_tuple_list)
+        return await send_api.custom_reply_set_to_stream(
+            reply_set=reply_set,
+            stream_id=chat_stream.stream_id,
+            typing=typing,
+            set_reply=set_reply,
+            reply_message=reply_message,
+            storage_message=storage_message,
+        )
+
+    async def send_forward(
+        self,
+        messages_list: List[Tuple[str, str, List[Tuple[ReplyContentType | str, str]]] | str],
+        storage_message: bool = True,
+    ) -> bool:
+        """转发消息
+
+        Args:
+            messages_list: 包含消息信息的列表，当传入自行生成的数据时，元素格式为 (sender_id, nickname, 消息体)；当传入消息ID时，元素格式为 "message_id"
+            其中消息体的格式为 [(内容类型, 内容), ...]
+            任意长度的消息都需要使用列表的形式传入
+            storage_message: 是否存储消息到数据库
 
         Returns:
             bool: 是否发送成功
@@ -205,8 +297,73 @@ class BaseCommand(ABC):
         if not chat_stream or not hasattr(chat_stream, "stream_id"):
             logger.error(f"{self.log_prefix} 缺少聊天流或stream_id")
             return False
+        reply_set = ReplySetModel()
+        forward_message_nodes: List[ForwardNode] = []
+        for message in messages_list:
+            if isinstance(message, str):
+                forward_message_node = ForwardNode.construct_as_id_reference(message)
+            elif isinstance(message, Tuple) and len(message) == 3:
+                sender_id, nickname, content_list = message
+                single_node_content_list: List[ReplyContent] = []
+                for node_content_type, node_content in content_list:
+                    reply_node_content = ReplyContent(content_type=node_content_type, content=node_content)
+                    single_node_content_list.append(reply_node_content)
+                forward_message_node = ForwardNode.construct_as_created_node(
+                    user_id=sender_id, user_nickname=nickname, content=single_node_content_list
+                )
+            else:
+                logger.warning(f"{self.log_prefix} 转发消息时遇到无效的消息格式: {message}")
+                continue
+            forward_message_nodes.append(forward_message_node)
+        reply_set.add_forward_content(forward_message_nodes)
+        return await send_api.custom_reply_set_to_stream(
+            reply_set=reply_set,
+            stream_id=chat_stream.stream_id,
+            storage_message=storage_message,
+            set_reply=False,
+            reply_message=None,
+        )
 
-        return await send_api.image_to_stream(image_base64, chat_stream.stream_id)
+    async def send_custom(
+        self,
+        message_type: str,
+        content: str | Dict,
+        display_message: str = "",
+        typing: bool = False,
+        set_reply: bool = False,
+        reply_message: Optional["DatabaseMessages"] = None,
+        storage_message: bool = True,
+    ) -> bool:
+        """发送指定类型的回复消息到当前聊天环境
+
+        Args:
+            message_type: 消息类型，如"text"、"image"、"emoji"、"voice"等
+            content: 消息内容
+            display_message: 显示消息（可选）
+            typing: 是否显示正在输入
+            set_reply: 是否作为回复发送
+            reply_message: 回复的消息对象（set_reply 为 True时必填）
+            storage_message: 是否存储消息到数据库
+
+        Returns:
+            bool: 是否发送成功
+        """
+        # 获取聊天流信息
+        chat_stream = self.message.chat_stream
+        if not chat_stream or not hasattr(chat_stream, "stream_id"):
+            logger.error(f"{self.log_prefix} 缺少聊天流或stream_id")
+            return False
+
+        return await send_api.custom_to_stream(
+            message_type=message_type,
+            content=content,
+            stream_id=chat_stream.stream_id,
+            display_message=display_message,
+            typing=typing,
+            set_reply=set_reply,
+            reply_message=reply_message,
+            storage_message=storage_message,
+        )
 
     @classmethod
     def get_command_info(cls) -> "CommandInfo":
@@ -219,13 +376,12 @@ class BaseCommand(ABC):
         Returns:
             CommandInfo: 生成的Command信息对象
         """
-
+        if "." in cls.command_name:
+            logger.error(f"Command名称 '{cls.command_name}' 包含非法字符 '.'，请使用下划线替代")
+            raise ValueError(f"Command名称 '{cls.command_name}' 包含非法字符 '.'，请使用下划线替代")
         return CommandInfo(
             name=cls.command_name,
             component_type=ComponentType.COMMAND,
             description=cls.command_description,
             command_pattern=cls.command_pattern,
-            command_help=cls.command_help,
-            command_examples=cls.command_examples.copy() if cls.command_examples else [],
-            intercept_message=cls.intercept_message,
         )

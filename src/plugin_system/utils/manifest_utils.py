@@ -4,12 +4,13 @@
 提供manifest文件的验证、生成和管理功能
 """
 
-import json
-import os
 import re
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Tuple
 from src.common.logger import get_logger
 from src.config.config import MMC_VERSION
+
+# if TYPE_CHECKING:
+#     from src.plugin_system.base.base_plugin import BasePlugin
 
 logger = get_logger("manifest_utils")
 
@@ -162,12 +163,11 @@ class VersionComparator:
                     version_normalized, max_normalized
                 )
 
-                if is_compatible:
-                    logger.info(f"版本兼容性检查：{compat_msg}")
-                    return True, compat_msg
-                else:
+                if not is_compatible:
                     return False, f"版本 {version_normalized} 高于最大支持版本 {max_normalized}，且无兼容性映射"
 
+                logger.info(f"版本兼容性检查：{compat_msg}")
+                return True, compat_msg
         return True, ""
 
     @staticmethod
@@ -305,7 +305,7 @@ class ManifestValidator:
         # 检查URL格式（可选字段）
         for url_field in ["homepage_url", "repository_url"]:
             if url_field in manifest_data and manifest_data[url_field]:
-                url = manifest_data[url_field]
+                url: str = manifest_data[url_field]
                 if not (url.startswith("http://") or url.startswith("https://")):
                     self.validation_warnings.append(f"{url_field}建议使用完整的URL格式")
 
@@ -357,163 +357,159 @@ class ManifestValidator:
 
         if self.validation_errors:
             report.append("❌ 验证错误:")
-            for error in self.validation_errors:
-                report.append(f"  - {error}")
-
+            report.extend(f"  - {error}" for error in self.validation_errors)
         if self.validation_warnings:
             report.append("⚠️ 验证警告:")
-            for warning in self.validation_warnings:
-                report.append(f"  - {warning}")
-
+            report.extend(f"  - {warning}" for warning in self.validation_warnings)
         if not self.validation_errors and not self.validation_warnings:
             report.append("✅ Manifest文件验证通过")
 
         return "\n".join(report)
 
 
-class ManifestGenerator:
-    """Manifest文件生成器"""
+# class ManifestGenerator:
+#     """Manifest文件生成器"""
 
-    def __init__(self):
-        self.template = {
-            "manifest_version": 1,
-            "name": "",
-            "version": "1.0.0",
-            "description": "",
-            "author": {"name": "", "url": ""},
-            "license": "MIT",
-            "host_application": {"min_version": "1.0.0", "max_version": "4.0.0"},
-            "homepage_url": "",
-            "repository_url": "",
-            "keywords": [],
-            "categories": [],
-            "default_locale": "zh-CN",
-            "locales_path": "_locales",
-        }
+#     def __init__(self):
+#         self.template = {
+#             "manifest_version": 1,
+#             "name": "",
+#             "version": "1.0.0",
+#             "description": "",
+#             "author": {"name": "", "url": ""},
+#             "license": "MIT",
+#             "host_application": {"min_version": "1.0.0", "max_version": "4.0.0"},
+#             "homepage_url": "",
+#             "repository_url": "",
+#             "keywords": [],
+#             "categories": [],
+#             "default_locale": "zh-CN",
+#             "locales_path": "_locales",
+#         }
 
-    def generate_from_plugin(self, plugin_instance) -> Dict[str, Any]:
-        """从插件实例生成manifest
+#     def generate_from_plugin(self, plugin_instance: BasePlugin) -> Dict[str, Any]:
+#         """从插件实例生成manifest
 
-        Args:
-            plugin_instance: BasePlugin实例
+#         Args:
+#             plugin_instance: BasePlugin实例
 
-        Returns:
-            Dict[str, Any]: 生成的manifest数据
-        """
-        manifest = self.template.copy()
+#         Returns:
+#             Dict[str, Any]: 生成的manifest数据
+#         """
+#         manifest = self.template.copy()
 
-        # 基本信息
-        manifest["name"] = plugin_instance.plugin_name
-        manifest["version"] = plugin_instance.plugin_version
-        manifest["description"] = plugin_instance.plugin_description
+#         # 基本信息
+#         manifest["name"] = plugin_instance.plugin_name
+#         manifest["version"] = plugin_instance.plugin_version
+#         manifest["description"] = plugin_instance.plugin_description
 
-        # 作者信息
-        if plugin_instance.plugin_author:
-            manifest["author"]["name"] = plugin_instance.plugin_author
+#         # 作者信息
+#         if plugin_instance.plugin_author:
+#             manifest["author"]["name"] = plugin_instance.plugin_author
 
-        # 组件信息
-        components = []
-        plugin_components = plugin_instance.get_plugin_components()
+#         # 组件信息
+#         components = []
+#         plugin_components = plugin_instance.get_plugin_components()
 
-        for component_info, component_class in plugin_components:
-            component_data = {
-                "type": component_info.component_type.value,
-                "name": component_info.name,
-                "description": component_info.description,
-            }
+#         for component_info, component_class in plugin_components:
+#             component_data: Dict[str, Any] = {
+#                 "type": component_info.component_type.value,
+#                 "name": component_info.name,
+#                 "description": component_info.description,
+#             }
 
-            # 添加激活模式信息（对于Action组件）
-            if hasattr(component_class, "focus_activation_type"):
-                activation_modes = []
-                if hasattr(component_class, "focus_activation_type"):
-                    activation_modes.append(component_class.focus_activation_type.value)
-                if hasattr(component_class, "normal_activation_type"):
-                    activation_modes.append(component_class.normal_activation_type.value)
-                component_data["activation_modes"] = list(set(activation_modes))
+#             # 添加激活模式信息（对于Action组件）
+#             if hasattr(component_class, "focus_activation_type"):
+#                 activation_modes = []
+#                 if hasattr(component_class, "focus_activation_type"):
+#                     activation_modes.append(component_class.focus_activation_type.value)
+#                 if hasattr(component_class, "normal_activation_type"):
+#                     activation_modes.append(component_class.normal_activation_type.value)
+#                 component_data["activation_modes"] = list(set(activation_modes))
 
-            # 添加关键词信息
-            if hasattr(component_class, "activation_keywords"):
-                keywords = getattr(component_class, "activation_keywords", [])
-                if keywords:
-                    component_data["keywords"] = keywords
+#             # 添加关键词信息
+#             if hasattr(component_class, "activation_keywords"):
+#                 keywords = getattr(component_class, "activation_keywords", [])
+#                 if keywords:
+#                     component_data["keywords"] = keywords
 
-            components.append(component_data)
+#             components.append(component_data)
 
-        manifest["plugin_info"] = {"is_built_in": True, "plugin_type": "general", "components": components}
+#         manifest["plugin_info"] = {"is_built_in": True, "plugin_type": "general", "components": components}
 
-        return manifest
+#         return manifest
 
-    def save_manifest(self, manifest_data: Dict[str, Any], plugin_dir: str) -> bool:
-        """保存manifest文件
+#     def save_manifest(self, manifest_data: Dict[str, Any], plugin_dir: str) -> bool:
+#         """保存manifest文件
 
-        Args:
-            manifest_data: manifest数据
-            plugin_dir: 插件目录
+#         Args:
+#             manifest_data: manifest数据
+#             plugin_dir: 插件目录
 
-        Returns:
-            bool: 是否保存成功
-        """
-        try:
-            manifest_path = os.path.join(plugin_dir, "_manifest.json")
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(manifest_data, f, ensure_ascii=False, indent=2)
-            logger.info(f"Manifest文件已保存: {manifest_path}")
-            return True
-        except Exception as e:
-            logger.error(f"保存manifest文件失败: {e}")
-            return False
-
-
-def validate_plugin_manifest(plugin_dir: str) -> bool:
-    """验证插件目录中的manifest文件
-
-    Args:
-        plugin_dir: 插件目录路径
-
-    Returns:
-        bool: 是否验证通过
-    """
-    manifest_path = os.path.join(plugin_dir, "_manifest.json")
-
-    if not os.path.exists(manifest_path):
-        logger.warning(f"未找到manifest文件: {manifest_path}")
-        return False
-
-    try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest_data = json.load(f)
-
-        validator = ManifestValidator()
-        is_valid = validator.validate_manifest(manifest_data)
-
-        logger.info(f"Manifest验证结果:\n{validator.get_validation_report()}")
-
-        return is_valid
-
-    except Exception as e:
-        logger.error(f"读取或验证manifest文件失败: {e}")
-        return False
+#         Returns:
+#             bool: 是否保存成功
+#         """
+#         try:
+#             manifest_path = os.path.join(plugin_dir, "_manifest.json")
+#             with open(manifest_path, "w", encoding="utf-8") as f:
+#                 json.dump(manifest_data, f, ensure_ascii=False, indent=2)
+#             logger.info(f"Manifest文件已保存: {manifest_path}")
+#             return True
+#         except Exception as e:
+#             logger.error(f"保存manifest文件失败: {e}")
+#             return False
 
 
-def generate_plugin_manifest(plugin_instance, save_to_file: bool = True) -> Optional[Dict[str, Any]]:
-    """为插件生成manifest文件
+# def validate_plugin_manifest(plugin_dir: str) -> bool:
+#     """验证插件目录中的manifest文件
 
-    Args:
-        plugin_instance: BasePlugin实例
-        save_to_file: 是否保存到文件
+#     Args:
+#         plugin_dir: 插件目录路径
 
-    Returns:
-        Optional[Dict[str, Any]]: 生成的manifest数据
-    """
-    try:
-        generator = ManifestGenerator()
-        manifest_data = generator.generate_from_plugin(plugin_instance)
+#     Returns:
+#         bool: 是否验证通过
+#     """
+#     manifest_path = os.path.join(plugin_dir, "_manifest.json")
 
-        if save_to_file and plugin_instance.plugin_dir:
-            generator.save_manifest(manifest_data, plugin_instance.plugin_dir)
+#     if not os.path.exists(manifest_path):
+#         logger.warning(f"未找到manifest文件: {manifest_path}")
+#         return False
 
-        return manifest_data
+#     try:
+#         with open(manifest_path, "r", encoding="utf-8") as f:
+#             manifest_data = json.load(f)
 
-    except Exception as e:
-        logger.error(f"生成manifest文件失败: {e}")
-        return None
+#         validator = ManifestValidator()
+#         is_valid = validator.validate_manifest(manifest_data)
+
+#         logger.info(f"Manifest验证结果:\n{validator.get_validation_report()}")
+
+#         return is_valid
+
+#     except Exception as e:
+#         logger.error(f"读取或验证manifest文件失败: {e}")
+#         return False
+
+
+# def generate_plugin_manifest(plugin_instance: BasePlugin, save_to_file: bool = True) -> Optional[Dict[str, Any]]:
+#     """为插件生成manifest文件
+
+#     Args:
+#         plugin_instance: BasePlugin实例
+#         save_to_file: 是否保存到文件
+
+#     Returns:
+#         Optional[Dict[str, Any]]: 生成的manifest数据
+#     """
+#     try:
+#         generator = ManifestGenerator()
+#         manifest_data = generator.generate_from_plugin(plugin_instance)
+
+#         if save_to_file and plugin_instance.plugin_dir:
+#             generator.save_manifest(manifest_data, plugin_instance.plugin_dir)
+
+#         return manifest_data
+
+#     except Exception as e:
+#         logger.error(f"生成manifest文件失败: {e}")
+#         return None

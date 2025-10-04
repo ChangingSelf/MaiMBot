@@ -1,20 +1,21 @@
-import logging
-
 # 使用基于时间戳的文件处理器，简单的轮转份数限制
-from pathlib import Path
-from typing import Callable, Optional
+
+import logging
 import json
 import threading
 import time
-from datetime import datetime, timedelta
-
 import structlog
-import toml
+import tomlkit
+
+from pathlib import Path
+from typing import Callable, Optional
+from datetime import datetime, timedelta
 
 # 创建logs目录
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True)
-
+logger_file = Path(__file__).resolve()
+PROJECT_ROOT = logger_file.parent.parent.parent.resolve()
 # 全局handler实例，避免重复创建
 _file_handler = None
 _console_handler = None
@@ -160,7 +161,7 @@ def close_handlers():
         _console_handler = None
 
 
-def remove_duplicate_handlers():
+def remove_duplicate_handlers():  # sourcery skip: for-append-to-extend, list-comprehension
     """移除重复的handler，特别是文件handler"""
     root_logger = logging.getLogger()
 
@@ -184,28 +185,39 @@ def remove_duplicate_handlers():
 
 
 # 读取日志配置
-def load_log_config():
+def load_log_config():  # sourcery skip: use-contextlib-suppress
     """从配置文件加载日志设置"""
     config_path = Path("config/bot_config.toml")
     default_config = {
-        "date_style": "Y-m-d H:i:s",
+        "date_style": "m-d H:i:s",
         "log_level_style": "lite",
-        "color_text": "title",
+        "color_text": "full",
         "log_level": "INFO",  # 全局日志级别（向下兼容）
         "console_log_level": "INFO",  # 控制台日志级别
         "file_log_level": "DEBUG",  # 文件日志级别
-        "suppress_libraries": [],
-        "library_log_levels": {},
+        "suppress_libraries": [
+            "faiss",
+            "httpx",
+            "urllib3",
+            "asyncio",
+            "websockets",
+            "httpcore",
+            "requests",
+            "peewee",
+            "openai",
+            "uvicorn",
+            "jieba",
+        ],
+        "library_log_levels": {"aiohttp": "WARNING"},
     }
 
     try:
         if config_path.exists():
             with open(config_path, "r", encoding="utf-8") as f:
-                config = toml.load(f)
+                config = tomlkit.load(f)
                 return config.get("log", default_config)
-    except Exception:
-        pass
-
+    except Exception as e:
+        print(f"[日志系统] 加载日志配置失败: {e}")
     return default_config
 
 
@@ -318,66 +330,60 @@ def reconfigure_existing_loggers():
 
 # 定义模块颜色映射
 MODULE_COLORS = {
+    # 发送
+    # "\033[38;5;67m" 这个颜色代码的含义如下：
+    # \033         ：转义序列的起始，表示后面是控制字符（ESC）
+    # [38;5;67m    ：
+    #   38         ：设置前景色（字体颜色），如果是背景色则用 48
+    #   5          ：表示使用8位（256色）模式
+    #   67         ：具体的颜色编号（0-255），这里是较暗的蓝色
+    "sender": "\033[38;5;24m",  # 67号色，较暗的蓝色，适合不显眼的日志
+    "send_api": "\033[38;5;24m",  # 208号色，橙色，适合突出显示
+    # 生成
+    "replyer": "\033[38;5;208m",  # 橙色
+    "llm_api": "\033[38;5;208m",  # 橙色
+    # 消息处理
+    "chat": "\033[38;5;82m",  # 亮蓝色
+    "chat_image": "\033[38;5;68m",  # 浅蓝色
+    # emoji
+    "emoji": "\033[38;5;214m",  # 橙黄色，偏向橙色
+    "emoji_api": "\033[38;5;214m",  # 橙黄色，偏向橙色
     # 核心模块
     "main": "\033[1;97m",  # 亮白色+粗体 (主程序)
-    "api": "\033[92m",  # 亮绿色
-    "emoji": "\033[92m",  # 亮绿色
-    "chat": "\033[94m",  # 亮蓝色
+    "memory": "\033[38;5;34m",  # 天蓝色
     "config": "\033[93m",  # 亮黄色
     "common": "\033[95m",  # 亮紫色
     "tools": "\033[96m",  # 亮青色
     "lpmm": "\033[96m",
     "plugin_system": "\033[91m",  # 亮红色
-    "experimental": "\033[97m",  # 亮白色
     "person_info": "\033[32m",  # 绿色
-    "individuality": "\033[34m",  # 蓝色
     "manager": "\033[35m",  # 紫色
     "llm_models": "\033[36m",  # 青色
-    "plugins": "\033[31m",  # 红色
-    "plugin_api": "\033[33m",  # 黄色
-    "remote": "\033[38;5;93m",  # 紫蓝色
+    "remote": "\033[38;5;242m",  # 深灰色，更不显眼
     "planner": "\033[36m",
-    "memory": "\033[34m",
-    "hfc": "\033[96m",
-    "base_action": "\033[96m",
-    "action_manager": "\033[34m",
-    # 关系系统
-    "relation": "\033[38;5;201m",  # 深粉色
+    "relation": "\033[38;5;139m",  # 柔和的紫色，不刺眼
     # 聊天相关模块
-    "normal_chat": "\033[38;5;81m",  # 亮蓝绿色
-    "normal_chat_response": "\033[38;5;123m",  # 青绿色
-    "normal_chat_expressor": "\033[38;5;117m",  # 浅蓝色
-    "normal_chat_action_modifier": "\033[38;5;111m",  # 蓝色
-    "normal_chat_planner": "\033[38;5;75m",  # 浅蓝色
-    "heartflow": "\033[38;5;213m",  # 粉色
-    "heartflow_utils": "\033[38;5;219m",  # 浅粉色
+    "hfc": "\033[38;5;175m",  # 柔和的粉色，不显眼但保持粉色系
+    "bc": "\033[38;5;175m",  # 柔和的粉色，不显眼但保持粉色系
     "sub_heartflow": "\033[38;5;207m",  # 粉紫色
     "subheartflow_manager": "\033[38;5;201m",  # 深粉色
-    "observation": "\033[38;5;141m",  # 紫色
     "background_tasks": "\033[38;5;240m",  # 灰色
     "chat_message": "\033[38;5;45m",  # 青色
     "chat_stream": "\033[38;5;51m",  # 亮青色
-    "sender": "\033[38;5;39m",  # 蓝色
     "message_storage": "\033[38;5;33m",  # 深蓝色
-    # 专注聊天模块
-    "replyer": "\033[38;5;166m",  # 橙色
-    "expressor": "\033[38;5;172m",  # 黄橙色
-    "planner_factory": "\033[38;5;178m",  # 黄色
-    "processor": "\033[38;5;184m",  # 黄绿色
-    "base_processor": "\033[38;5;190m",  # 绿黄色
-    "working_memory": "\033[38;5;22m",  # 深绿色
-    "memory_activator": "\033[38;5;28m",  # 绿色
+    "expressor": "\033[38;5;166m",  # 橙色
     # 插件系统
+    "plugins": "\033[31m",  # 红色
+    "plugin_api": "\033[33m",  # 黄色
     "plugin_manager": "\033[38;5;208m",  # 红色
     "base_plugin": "\033[38;5;202m",  # 橙红色
     "base_command": "\033[38;5;208m",  # 橙色
     "component_registry": "\033[38;5;214m",  # 橙黄色
     "stream_api": "\033[38;5;220m",  # 黄色
     "config_api": "\033[38;5;226m",  # 亮黄色
-    "hearflow_api": "\033[38;5;154m",  # 黄绿色
+    "heartflow_api": "\033[38;5;154m",  # 黄绿色
     "action_apis": "\033[38;5;118m",  # 绿色
     "independent_apis": "\033[38;5;82m",  # 绿色
-    "llm_api": "\033[38;5;46m",  # 亮绿色
     "database_api": "\033[38;5;10m",  # 绿色
     "utils_api": "\033[38;5;14m",  # 青色
     "message_api": "\033[38;5;6m",  # 青色
@@ -387,52 +393,114 @@ MODULE_COLORS = {
     "local_storage": "\033[38;5;141m",  # 紫色
     "willing": "\033[38;5;147m",  # 浅紫色
     # 工具模块
-    "tool_use": "\033[38;5;64m",  # 深绿色
-    "base_tool": "\033[38;5;70m",  # 绿色
-    "compare_numbers_tool": "\033[38;5;76m",  # 浅绿色
-    "change_mood_tool": "\033[38;5;82m",  # 绿色
-    "relationship_tool": "\033[38;5;88m",  # 深红色
+    "tool_use": "\033[38;5;172m",  # 橙褐色
+    "tool_executor": "\033[38;5;172m",  # 橙褐色
+    "base_tool": "\033[38;5;178m",  # 金黄色
     # 工具和实用模块
-    "prompt": "\033[38;5;99m",  # 紫色
     "prompt_build": "\033[38;5;105m",  # 紫色
     "chat_utils": "\033[38;5;111m",  # 蓝色
-    "chat_image": "\033[38;5;117m",  # 浅蓝色
-    "typo_gen": "\033[38;5;123m",  # 青绿色
     "maibot_statistic": "\033[38;5;129m",  # 紫色
     # 特殊功能插件
     "mute_plugin": "\033[38;5;240m",  # 灰色
-    "example_comprehensive": "\033[38;5;246m",  # 浅灰色
     "core_actions": "\033[38;5;117m",  # 深红色
     "tts_action": "\033[38;5;58m",  # 深黄色
     "doubao_pic_plugin": "\033[38;5;64m",  # 深绿色
-    "vtb_action": "\033[38;5;70m",  # 绿色
+    # Action组件
+    "no_reply_action": "\033[38;5;214m",  # 亮橙色，显眼但不像警告
+    "reply_action": "\033[38;5;46m",  # 亮绿色
+    "base_action": "\033[38;5;250m",  # 浅灰色
     # 数据库和消息
     "database_model": "\033[38;5;94m",  # 橙褐色
-    "maim_message": "\033[38;5;100m",  # 绿褐色
-    # 实验性模块
-    "pfc": "\033[38;5;252m",  # 浅灰色
+    "maim_message": "\033[38;5;140m",  # 紫褐色
     # 日志系统
     "logger": "\033[38;5;8m",  # 深灰色
-    "demo": "\033[38;5;15m",  # 白色
     "confirm": "\033[1;93m",  # 黄色+粗体
     # 模型相关
     "model_utils": "\033[38;5;164m",  # 紫红色
+    "relationship_fetcher": "\033[38;5;170m",  # 浅紫色
+    "relationship_builder": "\033[38;5;93m",  # 浅蓝色
+    "conflict_tracker": "\033[38;5;82m",  # 柔和的粉色，不显眼但保持粉色系
+}
+
+# 定义模块别名映射 - 将真实的logger名称映射到显示的别名
+MODULE_ALIASES = {
+    # 示例映射
+    "sender": "消息发送",
+    "send_api": "消息发送API",
+    "replyer": "言语",
+    "llm_api": "生成API",
+    "emoji": "表情包",
+    "emoji_api": "表情包API",
+    "chat": "所见",
+    "chat_image": "识图",
+    "action_manager": "动作",
+    "memory_activator": "记忆",
+    "tool_use": "工具",
+    "expressor": "表达方式",
+    "database_model": "数据库",
+    "mood": "情绪",
+    "memory": "记忆",
+    "tool_executor": "工具",
+    "hfc": "聊天节奏",
+    "plugin_manager": "插件",
+    "relationship_builder": "关系",
+    "llm_models": "模型",
+    "person_info": "人物",
+    "chat_stream": "聊天流",
+    "planner": "规划器",
+    "config": "配置",
+    "main": "主程序",
 }
 
 RESET_COLOR = "\033[0m"
+
+
+def convert_pathname_to_module(logger, method_name, event_dict):
+    # sourcery skip: extract-method, use-string-remove-affix
+    """将 pathname 转换为模块风格的路径"""
+    if "logger_name" in event_dict and event_dict["logger_name"] == "maim_message":
+        if "pathname" in event_dict:
+            del event_dict["pathname"]
+            event_dict["module"] = "maim_message"
+        return event_dict
+    if "pathname" in event_dict:
+        pathname = event_dict["pathname"]
+        try:
+            # 使用绝对路径确保准确性
+            pathname_path = Path(pathname).resolve()
+            rel_path = pathname_path.relative_to(PROJECT_ROOT)
+
+            # 转换为模块风格：移除 .py 扩展名，将路径分隔符替换为点
+            module_path = str(rel_path).replace("\\", ".").replace("/", ".")
+            if module_path.endswith(".py"):
+                module_path = module_path[:-3]
+
+            # 使用转换后的模块路径替换 module 字段
+            event_dict["module"] = module_path
+            # 移除原始的 pathname 字段
+            del event_dict["pathname"]
+        except Exception:
+            # 如果转换失败，删除 pathname 但保留原始的 module（如果有的话）
+            del event_dict["pathname"]
+            # 如果没有 module 字段，使用文件名作为备选
+            if "module" not in event_dict:
+                event_dict["module"] = Path(pathname).stem
+
+    return event_dict
 
 
 class ModuleColoredConsoleRenderer:
     """自定义控制台渲染器，为不同模块提供不同颜色"""
 
     def __init__(self, colors=True):
+        # sourcery skip: merge-duplicate-blocks, remove-redundant-if
         self._colors = colors
         self._config = LOG_CONFIG
 
         # 日志级别颜色
         self._level_colors = {
             "debug": "\033[38;5;208m",  # 橙色
-            "info": "\033[34m",  # 蓝色
+            "info": "\033[38;5;117m",  # 天蓝色
             "success": "\033[32m",  # 绿色
             "warning": "\033[33m",  # 黄色
             "error": "\033[31m",  # 红色
@@ -457,6 +525,7 @@ class ModuleColoredConsoleRenderer:
             self._enable_full_content_colors = False
 
     def __call__(self, logger, method_name, event_dict):
+        # sourcery skip: merge-duplicate-blocks
         """渲染日志消息"""
         # 获取基本信息
         timestamp = event_dict.get("timestamp", "")
@@ -505,15 +574,18 @@ class ModuleColoredConsoleRenderer:
         if self._colors and self._enable_module_colors and logger_name:
             module_color = MODULE_COLORS.get(logger_name, "")
 
-        # 模块名称（带颜色）
+        # 模块名称（带颜色和别名支持）
         if logger_name:
+            # 获取别名，如果没有别名则使用原名称
+            display_name = MODULE_ALIASES.get(logger_name, logger_name)
+
             if self._colors and self._enable_module_colors:
                 if module_color:
-                    module_part = f"{module_color}[{logger_name}]{RESET_COLOR}"
+                    module_part = f"{module_color}[{display_name}]{RESET_COLOR}"
                 else:
-                    module_part = f"[{logger_name}]"
+                    module_part = f"[{display_name}]"
             else:
-                module_part = f"[{logger_name}]"
+                module_part = f"[{display_name}]"
             parts.append(module_part)
 
         # 消息内容（确保转换为字符串）
@@ -539,7 +611,7 @@ class ModuleColoredConsoleRenderer:
         # 处理其他字段
         extras = []
         for key, value in event_dict.items():
-            if key not in ("timestamp", "level", "logger_name", "event"):
+            if key not in ("timestamp", "level", "logger_name", "event", "module", "lineno", "pathname"):
                 # 确保值也转换为字符串
                 if isinstance(value, (dict, list)):
                     try:
@@ -580,6 +652,13 @@ def configure_structlog():
         processors=[
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
+            structlog.processors.CallsiteParameterAdder(
+                parameters=[
+                    structlog.processors.CallsiteParameter.PATHNAME,
+                    structlog.processors.CallsiteParameter.LINENO,
+                ]
+            ),
+            convert_pathname_to_module,
             structlog.processors.StackInfoRenderer(),
             structlog.dev.set_exc_info,
             structlog.processors.TimeStamper(fmt=get_timestamp_format(), utc=False),
@@ -604,6 +683,10 @@ file_formatter = structlog.stdlib.ProcessorFormatter(
         structlog.stdlib.add_log_level,
         structlog.stdlib.PositionalArgumentsFormatter(),
         structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.CallsiteParameterAdder(
+            parameters=[structlog.processors.CallsiteParameter.PATHNAME, structlog.processors.CallsiteParameter.LINENO]
+        ),
+        convert_pathname_to_module,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
     ],
@@ -676,203 +759,11 @@ def get_logger(name: Optional[str]) -> structlog.stdlib.BoundLogger:
     """获取logger实例，支持按名称绑定"""
     if name is None:
         return raw_logger
-    logger = binds.get(name)
+    logger = binds.get(name)  # type: ignore
     if logger is None:
         logger: structlog.stdlib.BoundLogger = structlog.get_logger(name).bind(logger_name=name)
         binds[name] = logger
     return logger
-
-
-def configure_logging(
-    level: str = "INFO",
-    console_level: str = None,
-    file_level: str = None,
-    max_bytes: int = 5 * 1024 * 1024,
-    backup_count: int = 30,
-    log_dir: str = "logs",
-):
-    """动态配置日志参数"""
-    log_path = Path(log_dir)
-    log_path.mkdir(exist_ok=True)
-
-    # 更新文件handler配置
-    file_handler = get_file_handler()
-    if file_handler and isinstance(file_handler, TimestampedFileHandler):
-        file_handler.max_bytes = max_bytes
-        file_handler.backup_count = backup_count
-        file_handler.log_dir = Path(log_dir)
-
-        # 更新文件handler日志级别
-        if file_level:
-            file_handler.setLevel(getattr(logging, file_level.upper(), logging.INFO))
-
-    # 更新控制台handler日志级别
-    console_handler = get_console_handler()
-    if console_handler and console_level:
-        console_handler.setLevel(getattr(logging, console_level.upper(), logging.INFO))
-
-    # 设置根logger日志级别为最低级别
-    if console_level or file_level:
-        console_level_num = getattr(logging, (console_level or level).upper(), logging.INFO)
-        file_level_num = getattr(logging, (file_level or level).upper(), logging.INFO)
-        min_level = min(console_level_num, file_level_num)
-        root_logger = logging.getLogger()
-        root_logger.setLevel(min_level)
-    else:
-        root_logger = logging.getLogger()
-        root_logger.setLevel(getattr(logging, level.upper()))
-
-
-def set_module_color(module_name: str, color_code: str):
-    """为指定模块设置颜色
-
-    Args:
-        module_name: 模块名称
-        color_code: ANSI颜色代码，例如 '\033[92m' 表示亮绿色
-    """
-    MODULE_COLORS[module_name] = color_code
-
-
-def get_module_colors():
-    """获取当前模块颜色配置"""
-    return MODULE_COLORS.copy()
-
-
-def reload_log_config():
-    """重新加载日志配置"""
-    global LOG_CONFIG
-    LOG_CONFIG = load_log_config()
-
-    # 重新设置handler的日志级别
-    file_handler = get_file_handler()
-    if file_handler:
-        file_level = LOG_CONFIG.get("file_log_level", LOG_CONFIG.get("log_level", "INFO"))
-        file_handler.setLevel(getattr(logging, file_level.upper(), logging.INFO))
-
-    console_handler = get_console_handler()
-    if console_handler:
-        console_level = LOG_CONFIG.get("console_log_level", LOG_CONFIG.get("log_level", "INFO"))
-        console_handler.setLevel(getattr(logging, console_level.upper(), logging.INFO))
-
-    # 重新配置console渲染器
-    root_logger = logging.getLogger()
-    for handler in root_logger.handlers:
-        if isinstance(handler, logging.StreamHandler):
-            # 这是控制台处理器，更新其格式化器
-            handler.setFormatter(
-                structlog.stdlib.ProcessorFormatter(
-                    processor=ModuleColoredConsoleRenderer(colors=True),
-                    foreign_pre_chain=[
-                        structlog.stdlib.add_logger_name,
-                        structlog.stdlib.add_log_level,
-                        structlog.stdlib.PositionalArgumentsFormatter(),
-                        structlog.processors.TimeStamper(fmt=get_timestamp_format(), utc=False),
-                        structlog.processors.StackInfoRenderer(),
-                        structlog.processors.format_exc_info,
-                    ],
-                )
-            )
-
-    # 重新配置第三方库日志
-    configure_third_party_loggers()
-
-    # 重新配置所有已存在的logger
-    reconfigure_existing_loggers()
-
-
-def get_log_config():
-    """获取当前日志配置"""
-    return LOG_CONFIG.copy()
-
-
-def set_console_log_level(level: str):
-    """设置控制台日志级别
-
-    Args:
-        level: 日志级别 ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
-    """
-    global LOG_CONFIG
-    LOG_CONFIG["console_log_level"] = level.upper()
-
-    console_handler = get_console_handler()
-    if console_handler:
-        console_handler.setLevel(getattr(logging, level.upper(), logging.INFO))
-
-    # 重新设置root logger级别
-    configure_third_party_loggers()
-
-    logger = get_logger("logger")
-    logger.info(f"控制台日志级别已设置为: {level.upper()}")
-
-
-def set_file_log_level(level: str):
-    """设置文件日志级别
-
-    Args:
-        level: 日志级别 ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
-    """
-    global LOG_CONFIG
-    LOG_CONFIG["file_log_level"] = level.upper()
-
-    file_handler = get_file_handler()
-    if file_handler:
-        file_handler.setLevel(getattr(logging, level.upper(), logging.INFO))
-
-    # 重新设置root logger级别
-    configure_third_party_loggers()
-
-    logger = get_logger("logger")
-    logger.info(f"文件日志级别已设置为: {level.upper()}")
-
-
-def get_current_log_levels():
-    """获取当前的日志级别设置"""
-    file_handler = get_file_handler()
-    console_handler = get_console_handler()
-
-    file_level = logging.getLevelName(file_handler.level) if file_handler else "UNKNOWN"
-    console_level = logging.getLevelName(console_handler.level) if console_handler else "UNKNOWN"
-
-    return {
-        "console_level": console_level,
-        "file_level": file_level,
-        "root_level": logging.getLevelName(logging.getLogger().level),
-    }
-
-
-def force_reset_all_loggers():
-    """强制重置所有logger，解决格式不一致问题"""
-    # 先关闭现有的handler
-    close_handlers()
-
-    # 清除所有现有的logger配置
-    logging.getLogger().manager.loggerDict.clear()
-
-    # 重新配置根logger
-    root_logger = logging.getLogger()
-    root_logger.handlers.clear()
-
-    # 使用单例handler避免重复创建
-    file_handler = get_file_handler()
-    console_handler = get_console_handler()
-
-    # 重新添加我们的handler
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
-
-    # 设置格式化器
-    file_handler.setFormatter(file_formatter)
-    console_handler.setFormatter(console_formatter)
-
-    # 设置根logger级别为所有handler中最低的级别
-    console_level = LOG_CONFIG.get("console_log_level", LOG_CONFIG.get("log_level", "INFO"))
-    file_level = LOG_CONFIG.get("file_log_level", LOG_CONFIG.get("log_level", "INFO"))
-
-    console_level_num = getattr(logging, console_level.upper(), logging.INFO)
-    file_level_num = getattr(logging, file_level.upper(), logging.INFO)
-    min_level = min(console_level_num, file_level_num)
-
-    root_logger.setLevel(min_level)
 
 
 def initialize_logging():
@@ -882,6 +773,7 @@ def initialize_logging():
     """
     global LOG_CONFIG
     LOG_CONFIG = load_log_config()
+    # print(LOG_CONFIG)
     configure_third_party_loggers()
     reconfigure_existing_loggers()
 
@@ -893,67 +785,10 @@ def initialize_logging():
     console_level = LOG_CONFIG.get("console_log_level", LOG_CONFIG.get("log_level", "INFO"))
     file_level = LOG_CONFIG.get("file_log_level", LOG_CONFIG.get("log_level", "INFO"))
 
-    logger.info("日志系统已重新初始化:")
+    logger.info("日志系统已初始化:")
     logger.info(f"  - 控制台级别: {console_level}")
     logger.info(f"  - 文件级别: {file_level}")
-    logger.info("  - 轮转份数: 30个文件")
-    logger.info("  - 自动清理: 30天前的日志")
-
-
-def force_initialize_logging():
-    """强制重新初始化整个日志系统，解决格式不一致问题"""
-    global LOG_CONFIG
-    LOG_CONFIG = load_log_config()
-
-    # 强制重置所有logger
-    force_reset_all_loggers()
-
-    # 重新配置structlog
-    configure_structlog()
-
-    # 配置第三方库
-    configure_third_party_loggers()
-
-    # 输出初始化信息
-    logger = get_logger("logger")
-    console_level = LOG_CONFIG.get("console_log_level", LOG_CONFIG.get("log_level", "INFO"))
-    file_level = LOG_CONFIG.get("file_log_level", LOG_CONFIG.get("log_level", "INFO"))
-    logger.info(
-        f"日志系统已强制重新初始化，控制台级别: {console_level}，文件级别: {file_level}，轮转份数: 30个文件，所有logger格式已统一"
-    )
-
-
-def show_module_colors():
-    """显示所有模块的颜色效果"""
-    get_logger("demo")
-    print("\n=== 模块颜色展示 ===")
-
-    for module_name, _color_code in MODULE_COLORS.items():
-        # 临时创建一个该模块的logger来展示颜色
-        demo_logger = structlog.get_logger(module_name).bind(logger_name=module_name)
-        demo_logger.info(f"这是 {module_name} 模块的颜色效果")
-
-    print("=== 颜色展示结束 ===\n")
-
-
-def format_json_for_logging(data, indent=2, ensure_ascii=False):
-    """将JSON数据格式化为可读字符串
-
-    Args:
-        data: 要格式化的数据（字典、列表等）
-        indent: 缩进空格数
-        ensure_ascii: 是否确保ASCII编码
-
-    Returns:
-        str: 格式化后的JSON字符串
-    """
-    if isinstance(data, str):
-        # 如果是JSON字符串，先解析再格式化
-        parsed_data = json.loads(data)
-        return json.dumps(parsed_data, indent=indent, ensure_ascii=ensure_ascii)
-    else:
-        # 如果是对象，直接格式化
-        return json.dumps(data, indent=indent, ensure_ascii=ensure_ascii)
+    logger.info("  - 轮转份数: 30个文件|自动清理: 30天前的日志")
 
 
 def cleanup_old_logs():
@@ -991,43 +826,14 @@ def start_log_cleanup_task():
 
     def cleanup_task():
         while True:
-            time.sleep(24 * 60 * 60)  # 每24小时执行一次
             cleanup_old_logs()
+            time.sleep(24 * 60 * 60)  # 每24小时执行一次
 
     cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
     cleanup_thread.start()
 
     logger = get_logger("logger")
     logger.info("已启动日志清理任务，将自动清理30天前的日志文件（轮转份数限制: 30个文件）")
-
-
-def get_log_stats():
-    """获取日志文件统计信息"""
-    stats = {"total_files": 0, "total_size": 0, "files": []}
-
-    try:
-        if not LOG_DIR.exists():
-            return stats
-
-        for log_file in LOG_DIR.glob("*.log*"):
-            file_info = {
-                "name": log_file.name,
-                "size": log_file.stat().st_size,
-                "modified": datetime.fromtimestamp(log_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-            stats["files"].append(file_info)
-            stats["total_files"] += 1
-            stats["total_size"] += file_info["size"]
-
-        # 按修改时间排序
-        stats["files"].sort(key=lambda x: x["modified"], reverse=True)
-
-    except Exception as e:
-        logger = get_logger("logger")
-        logger.error(f"获取日志统计信息时出错: {e}")
-
-    return stats
 
 
 def shutdown_logging():

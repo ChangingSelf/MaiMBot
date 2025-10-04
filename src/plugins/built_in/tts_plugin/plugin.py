@@ -1,7 +1,8 @@
-from src.plugin_system.base.base_plugin import BasePlugin, register_plugin
+from src.plugin_system.apis.plugin_register_api import register_plugin
+from src.plugin_system.base.base_plugin import BasePlugin
 from src.plugin_system.base.component_types import ComponentInfo
 from src.common.logger import get_logger
-from src.plugin_system.base.base_action import BaseAction, ActionActivationType, ChatMode
+from src.plugin_system.base.base_action import BaseAction, ActionActivationType
 from src.plugin_system.base.config_types import ConfigField
 from typing import Tuple, List, Type
 
@@ -12,22 +13,16 @@ class TTSAction(BaseAction):
     """TTS语音转换动作处理类"""
 
     # 激活设置
-    focus_activation_type = ActionActivationType.LLM_JUDGE
-    normal_activation_type = ActionActivationType.KEYWORD
-    mode_enable = ChatMode.ALL
+    activation_type = ActionActivationType.LLM_JUDGE
     parallel_action = False
 
     # 动作基本信息
     action_name = "tts_action"
     action_description = "将文本转换为语音进行播放，适用于需要语音输出的场景"
 
-    # 关键词配置 - Normal模式下使用关键词触发
-    activation_keywords = ["语音", "tts", "播报", "读出来", "语音播放", "听", "朗读"]
-    keyword_case_sensitive = False
-
     # 动作参数定义
     action_parameters = {
-        "text": "需要转换为语音的文本内容，必填，内容应当适合语音播报，语句流畅、清晰",
+        "voice_text": "你想用语音表达的内容，这段内容将会以语音形式发出",
     }
 
     # 动作使用场景
@@ -46,7 +41,7 @@ class TTSAction(BaseAction):
         logger.info(f"{self.log_prefix} 执行TTS动作: {self.reasoning}")
 
         # 获取要转换的文本
-        text = self.action_data.get("text")
+        text = self.action_data.get("voice_text")
 
         if not text:
             logger.error(f"{self.log_prefix} 执行TTS动作时未提供文本内容")
@@ -58,6 +53,11 @@ class TTSAction(BaseAction):
         try:
             # 发送TTS消息
             await self.send_custom(message_type="tts_text", content=processed_text)
+
+            # 记录动作信息
+            await self.store_action_info(
+                action_build_into_prompt=True, action_prompt_display="已经发送了语音消息。", action_done=True
+            )
 
             logger.info(f"{self.log_prefix} TTS动作执行成功，文本长度: {len(processed_text)}")
             return True, "TTS动作执行成功"
@@ -86,7 +86,7 @@ class TTSAction(BaseAction):
 
         # 确保句子结尾有合适的标点
         if not any(processed_text.endswith(end) for end in [".", "?", "!", "。", "！", "？"]):
-            processed_text = processed_text + "。"
+            processed_text = f"{processed_text}。"
 
         return processed_text
 
@@ -101,9 +101,11 @@ class TTSPlugin(BasePlugin):
     """
 
     # 插件基本信息
-    plugin_name = "tts_plugin"  # 内部标识符
-    enable_plugin = True
-    config_file_name = "config.toml"
+    plugin_name: str = "tts_plugin"  # 内部标识符
+    enable_plugin: bool = True
+    dependencies: list[str] = []  # 插件依赖列表
+    python_dependencies: list[str] = []  # Python包依赖列表
+    config_file_name: str = "config.toml"
 
     # 配置节描述
     config_section_descriptions = {
@@ -113,7 +115,7 @@ class TTSPlugin(BasePlugin):
     }
 
     # 配置Schema定义
-    config_schema = {
+    config_schema: dict = {
         "plugin": {
             "name": ConfigField(type=str, default="tts_plugin", description="插件名称", required=True),
             "version": ConfigField(type=str, default="0.1.0", description="插件版本号"),

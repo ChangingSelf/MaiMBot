@@ -1,21 +1,101 @@
-from src.config.config import global_config
-from typing import List, Dict, Any, Tuple  # 确保类型提示被导入
-import time  # 导入 time 模块以获取当前时间
+import time
 import random
 import re
-from src.common.message_repository import find_messages, count_messages
-from src.person_info.person_info import PersonInfoManager, get_person_info_manager
-from src.chat.utils.utils import translate_timestamp_to_human_readable
+
+from typing import List, Dict, Any, Tuple, Optional, Callable, Iterable
 from rich.traceback import install
+
+from src.config.config import global_config
+from src.common.logger import get_logger
+from src.common.message_repository import find_messages, count_messages
+from src.common.data_models.database_data_model import DatabaseMessages, DatabaseActionRecords
+from src.common.data_models.message_data_model import MessageAndActionModel
 from src.common.database.database_model import ActionRecords
 from src.common.database.database_model import Images
+from src.person_info.person_info import Person, get_person_id
+from src.chat.utils.utils import translate_timestamp_to_human_readable, assign_message_ids
 
 install(extra_lines=3)
+logger = get_logger("chat_message_builder")
 
 
-def get_raw_msg_by_timestamp(
-    timestamp_start: float, timestamp_end: float, limit: int = 0, limit_mode: str = "latest"
-) -> List[Dict[str, Any]]:
+def replace_user_references(
+    content: Optional[str],
+    platform: str,
+    name_resolver: Optional[Callable[[str, str], str]] = None,
+    replace_bot_name: bool = True,
+) -> str:
+    """
+    替换内容中的用户引用格式，包括回复<aaa:bbb>和@<aaa:bbb>格式
+
+    Args:
+        content: 要处理的内容字符串
+        platform: 平台标识
+        name_resolver: 名称解析函数，接收(platform, user_id)参数，返回用户名称
+                       如果为None，则使用默认的person_info_manager
+        replace_bot_name: 是否将机器人的user_id替换为"机器人昵称(你)"
+
+    Returns:
+        str: 处理后的内容字符串
+    """
+    if not content:
+        return ""
+    if name_resolver is None:
+
+        def default_resolver(platform: str, user_id: str) -> str:
+            # 检查是否是机器人自己
+            if replace_bot_name and user_id == global_config.bot.qq_account:
+                return f"{global_config.bot.nickname}(你)"
+            person = Person(platform=platform, user_id=user_id)
+            return person.person_name or user_id  # type: ignore
+
+        name_resolver = default_resolver
+
+    # 处理回复<aaa:bbb>格式
+    reply_pattern = r"回复<([^:<>]+):([^:<>]+)>"
+    match = re.search(reply_pattern, content)
+    if match:
+        aaa = match[1]
+        bbb = match[2]
+        try:
+            # 检查是否是机器人自己
+            if replace_bot_name and bbb == global_config.bot.qq_account:
+                reply_person_name = f"{global_config.bot.nickname}(你)"
+            else:
+                reply_person_name = name_resolver(platform, bbb) or aaa
+            content = re.sub(reply_pattern, f"回复 {reply_person_name}", content, count=1)
+        except Exception:
+            # 如果解析失败，使用原始昵称
+            content = re.sub(reply_pattern, f"回复 {aaa}", content, count=1)
+
+    # 处理@<aaa:bbb>格式
+    at_pattern = r"@<([^:<>]+):([^:<>]+)>"
+    at_matches = list(re.finditer(at_pattern, content))
+    if at_matches:
+        new_content = ""
+        last_end = 0
+        for m in at_matches:
+            new_content += content[last_end : m.start()]
+            aaa = m.group(1)
+            bbb = m.group(2)
+            try:
+                # 检查是否是机器人自己
+                if replace_bot_name and bbb == global_config.bot.qq_account:
+                    at_person_name = f"{global_config.bot.nickname}(你)"
+                else:
+                    at_person_name = name_resolver(platform, bbb) or aaa
+                new_content += f"@{at_person_name}"
+            except Exception:
+                # 如果解析失败，使用原始昵称
+                new_content += f"@{aaa}"
+            last_end = m.end()
+        new_content += content[last_end:]
+        content = new_content
+
+    return content
+
+
+def get_raw_msg_by_timestamp(timestamp_start: float, timestamp_end: float, limit: int = 0, limit_mode: str = "latest"):
     """
     获取从指定时间戳到指定时间戳的消息，按时间升序排序，返回消息列表
     limit: 限制返回的消息数量，0为不限制
@@ -28,8 +108,14 @@ def get_raw_msg_by_timestamp(
 
 
 def get_raw_msg_by_timestamp_with_chat(
-    chat_id: str, timestamp_start: float, timestamp_end: float, limit: int = 0, limit_mode: str = "latest"
-) -> List[Dict[str, Any]]:
+    chat_id: str,
+    timestamp_start: float,
+    timestamp_end: float,
+    limit: int = 0,
+    limit_mode: str = "latest",
+    filter_bot=False,
+    filter_command=False,
+) -> List[DatabaseMessages]:
     """获取在特定聊天从指定时间戳到指定时间戳的消息，按时间升序排序，返回消息列表
     limit: 限制返回的消息数量，0为不限制
     limit_mode: 当 limit > 0 时生效。 'earliest' 表示获取最早的记录， 'latest' 表示获取最新的记录。默认为 'latest'。
@@ -38,12 +124,25 @@ def get_raw_msg_by_timestamp_with_chat(
     # 只有当 limit 为 0 时才应用外部 sort
     sort_order = [("time", 1)] if limit == 0 else None
     # 直接将 limit_mode 传递给 find_messages
-    return find_messages(message_filter=filter_query, sort=sort_order, limit=limit, limit_mode=limit_mode)
+    # print(f"get_raw_msg_by_timestamp_with_chat: {chat_id}, {timestamp_start}, {timestamp_end}, {limit}, {limit_mode}, {filter_bot}, {filter_command}")
+    return find_messages(
+        message_filter=filter_query,
+        sort=sort_order,
+        limit=limit,
+        limit_mode=limit_mode,
+        filter_bot=filter_bot,
+        filter_command=filter_command,
+    )
 
 
 def get_raw_msg_by_timestamp_with_chat_inclusive(
-    chat_id: str, timestamp_start: float, timestamp_end: float, limit: int = 0, limit_mode: str = "latest"
-) -> List[Dict[str, Any]]:
+    chat_id: str,
+    timestamp_start: float,
+    timestamp_end: float,
+    limit: int = 0,
+    limit_mode: str = "latest",
+    filter_bot=False,
+) -> List[DatabaseMessages]:
     """获取在特定聊天从指定时间戳到指定时间戳的消息（包含边界），按时间升序排序，返回消息列表
     limit: 限制返回的消息数量，0为不限制
     limit_mode: 当 limit > 0 时生效。 'earliest' 表示获取最早的记录， 'latest' 表示获取最新的记录。默认为 'latest'。
@@ -52,17 +151,19 @@ def get_raw_msg_by_timestamp_with_chat_inclusive(
     # 只有当 limit 为 0 时才应用外部 sort
     sort_order = [("time", 1)] if limit == 0 else None
     # 直接将 limit_mode 传递给 find_messages
-    return find_messages(message_filter=filter_query, sort=sort_order, limit=limit, limit_mode=limit_mode)
+    return find_messages(
+        message_filter=filter_query, sort=sort_order, limit=limit, limit_mode=limit_mode, filter_bot=filter_bot
+    )
 
 
 def get_raw_msg_by_timestamp_with_chat_users(
     chat_id: str,
     timestamp_start: float,
     timestamp_end: float,
-    person_ids: list,
+    person_ids: List[str],
     limit: int = 0,
     limit_mode: str = "latest",
-) -> List[Dict[str, Any]]:
+) -> List[DatabaseMessages]:
     """获取某些特定用户在特定聊天从指定时间戳到指定时间戳的消息，按时间升序排序，返回消息列表
     limit: 限制返回的消息数量，0为不限制
     limit_mode: 当 limit > 0 时生效。 'earliest' 表示获取最早的记录， 'latest' 表示获取最新的记录。默认为 'latest'。
@@ -77,9 +178,78 @@ def get_raw_msg_by_timestamp_with_chat_users(
     return find_messages(message_filter=filter_query, sort=sort_order, limit=limit, limit_mode=limit_mode)
 
 
+def get_actions_by_timestamp_with_chat(
+    chat_id: str,
+    timestamp_start: float = 0,
+    timestamp_end: float = time.time(),
+    limit: int = 0,
+    limit_mode: str = "latest",
+) -> List[DatabaseActionRecords]:
+    """获取在特定聊天从指定时间戳到指定时间戳的动作记录，按时间升序排序，返回动作记录列表"""
+    query = ActionRecords.select().where(
+        (ActionRecords.chat_id == chat_id)
+        & (ActionRecords.time > timestamp_start)  # type: ignore
+        & (ActionRecords.time < timestamp_end)  # type: ignore
+    )
+
+    if limit > 0:
+        if limit_mode == "latest":
+            query = query.order_by(ActionRecords.time.desc()).limit(limit)
+            # 获取后需要反转列表，以保持最终输出为时间升序
+            actions = list(query)
+            actions.reverse()
+        else:  # earliest
+            query = query.order_by(ActionRecords.time.asc()).limit(limit)
+    else:
+        query = query.order_by(ActionRecords.time.asc())
+
+    actions = list(query)
+    return [
+        DatabaseActionRecords(
+            action_id=action.action_id,
+            time=action.time,
+            action_name=action.action_name,
+            action_data=action.action_data,
+            action_done=action.action_done,
+            action_build_into_prompt=action.action_build_into_prompt,
+            action_prompt_display=action.action_prompt_display,
+            chat_id=action.chat_id,
+            chat_info_stream_id=action.chat_info_stream_id,
+            chat_info_platform=action.chat_info_platform,
+            action_reasoning=action.action_reasoning,
+        )
+        for action in actions
+    ]
+
+
+def get_actions_by_timestamp_with_chat_inclusive(
+    chat_id: str, timestamp_start: float, timestamp_end: float, limit: int = 0, limit_mode: str = "latest"
+) -> List[Dict[str, Any]]:
+    """获取在特定聊天从指定时间戳到指定时间戳的动作记录（包含边界），按时间升序排序，返回动作记录列表"""
+    query = ActionRecords.select().where(
+        (ActionRecords.chat_id == chat_id)
+        & (ActionRecords.time >= timestamp_start)  # type: ignore
+        & (ActionRecords.time <= timestamp_end)  # type: ignore
+    )
+
+    if limit > 0:
+        if limit_mode == "latest":
+            query = query.order_by(ActionRecords.time.desc()).limit(limit)
+            # 获取后需要反转列表，以保持最终输出为时间升序
+            actions = list(query)
+            return [action.__data__ for action in reversed(actions)]
+        else:  # earliest
+            query = query.order_by(ActionRecords.time.asc()).limit(limit)
+    else:
+        query = query.order_by(ActionRecords.time.asc())
+
+    actions = list(query)
+    return [action.__data__ for action in actions]
+
+
 def get_raw_msg_by_timestamp_random(
     timestamp_start: float, timestamp_end: float, limit: int = 0, limit_mode: str = "latest"
-) -> List[Dict[str, Any]]:
+) -> List[DatabaseMessages]:
     """
     先在范围时间戳内随机选择一条消息，取得消息的chat_id，然后根据chat_id获取该聊天在指定时间戳范围内的消息
     """
@@ -89,15 +259,15 @@ def get_raw_msg_by_timestamp_random(
         return []
     # 随机选一条
     msg = random.choice(all_msgs)
-    chat_id = msg["chat_id"]
-    timestamp_start = msg["time"]
+    chat_id = msg.chat_id
+    timestamp_start = msg.time
     # 用 chat_id 获取该聊天在指定时间戳范围内的消息
     return get_raw_msg_by_timestamp_with_chat(chat_id, timestamp_start, timestamp_end, limit, "earliest")
 
 
 def get_raw_msg_by_timestamp_with_users(
     timestamp_start: float, timestamp_end: float, person_ids: list, limit: int = 0, limit_mode: str = "latest"
-) -> List[Dict[str, Any]]:
+) -> List[DatabaseMessages]:
     """获取某些特定用户在 *所有聊天* 中从指定时间戳到指定时间戳的消息，按时间升序排序，返回消息列表
     limit: 限制返回的消息数量，0为不限制
     limit_mode: 当 limit > 0 时生效。 'earliest' 表示获取最早的记录， 'latest' 表示获取最新的记录。默认为 'latest'。
@@ -108,7 +278,7 @@ def get_raw_msg_by_timestamp_with_users(
     return find_messages(message_filter=filter_query, sort=sort_order, limit=limit, limit_mode=limit_mode)
 
 
-def get_raw_msg_before_timestamp(timestamp: float, limit: int = 0) -> List[Dict[str, Any]]:
+def get_raw_msg_before_timestamp(timestamp: float, limit: int = 0) -> List[DatabaseMessages]:
     """获取指定时间戳之前的消息，按时间升序排序，返回消息列表
     limit: 限制返回的消息数量，0为不限制
     """
@@ -117,7 +287,7 @@ def get_raw_msg_before_timestamp(timestamp: float, limit: int = 0) -> List[Dict[
     return find_messages(message_filter=filter_query, sort=sort_order, limit=limit)
 
 
-def get_raw_msg_before_timestamp_with_chat(chat_id: str, timestamp: float, limit: int = 0) -> List[Dict[str, Any]]:
+def get_raw_msg_before_timestamp_with_chat(chat_id: str, timestamp: float, limit: int = 0) -> List[DatabaseMessages]:
     """获取指定时间戳之前的消息，按时间升序排序，返回消息列表
     limit: 限制返回的消息数量，0为不限制
     """
@@ -126,7 +296,9 @@ def get_raw_msg_before_timestamp_with_chat(chat_id: str, timestamp: float, limit
     return find_messages(message_filter=filter_query, sort=sort_order, limit=limit)
 
 
-def get_raw_msg_before_timestamp_with_users(timestamp: float, person_ids: list, limit: int = 0) -> List[Dict[str, Any]]:
+def get_raw_msg_before_timestamp_with_users(
+    timestamp: float, person_ids: list, limit: int = 0
+) -> List[DatabaseMessages]:
     """获取指定时间戳之前的消息，按时间升序排序，返回消息列表
     limit: 限制返回的消息数量，0为不限制
     """
@@ -135,7 +307,7 @@ def get_raw_msg_before_timestamp_with_users(timestamp: float, person_ids: list, 
     return find_messages(message_filter=filter_query, sort=sort_order, limit=limit)
 
 
-def num_new_messages_since(chat_id: str, timestamp_start: float = 0.0, timestamp_end: float = None) -> int:
+def num_new_messages_since(chat_id: str, timestamp_start: float = 0.0, timestamp_end: Optional[float] = None) -> int:
     """
     检查特定聊天从 timestamp_start (不含) 到 timestamp_end (不含) 之间有多少新消息。
     如果 timestamp_end 为 None，则检查从 timestamp_start (不含) 到当前时间的消息。
@@ -167,15 +339,16 @@ def num_new_messages_since_with_users(
 
 
 def _build_readable_messages_internal(
-    messages: List[Dict[str, Any]],
+    messages: List[MessageAndActionModel],
     replace_bot_name: bool = True,
-    merge_messages: bool = False,
     timestamp_mode: str = "relative",
     truncate: bool = False,
-    pic_id_mapping: Dict[str, str] = None,
+    pic_id_mapping: Optional[Dict[str, str]] = None,
     pic_counter: int = 1,
     show_pic: bool = True,
+    message_id_list: Optional[List[Tuple[str, DatabaseMessages]]] = None,
 ) -> Tuple[str, List[Tuple[float, str, str]], Dict[str, str], int]:
+    # sourcery skip: use-getitem-for-re-match-groups
     """
     内部辅助函数，构建可读消息字符串和原始消息详情列表。
 
@@ -194,24 +367,34 @@ def _build_readable_messages_internal(
     if not messages:
         return "", [], pic_id_mapping or {}, pic_counter
 
-    message_details_raw: List[Tuple[float, str, str]] = []
+    detailed_messages_raw: List[Tuple[float, str, str, bool]] = []
 
     # 使用传入的映射字典，如果没有则创建新的
     if pic_id_mapping is None:
         pic_id_mapping = {}
     current_pic_counter = pic_counter
 
-    def process_pic_ids(content: str) -> str:
+    # 创建时间戳到消息ID的映射，用于在消息前添加[id]标识符
+    timestamp_to_id_mapping: Dict[float, str] = {}
+    if message_id_list:
+        for msg_id, msg in message_id_list:
+            timestamp = msg.time
+            if timestamp is not None:
+                timestamp_to_id_mapping[timestamp] = msg_id
+
+    def process_pic_ids(content: Optional[str]) -> str:
         """处理内容中的图片ID，将其替换为[图片x]格式"""
-        nonlocal current_pic_counter
+        if content is None:
+            logger.warning("Content is None when processing pic IDs.")
+            raise ValueError("Content is None")
 
         # 匹配 [picid:xxxxx] 格式
         pic_pattern = r"\[picid:([^\]]+)\]"
 
-        def replace_pic_id(match):
+        def replace_pic_id(match: re.Match) -> str:
             nonlocal current_pic_counter
+            nonlocal pic_counter
             pic_id = match.group(1)
-
             if pic_id not in pic_id_mapping:
                 pic_id_mapping[pic_id] = f"图片{current_pic_counter}"
                 current_pic_counter += 1
@@ -220,45 +403,21 @@ def _build_readable_messages_internal(
 
         return re.sub(pic_pattern, replace_pic_id, content)
 
-    # 1 & 2: 获取发送者信息并提取消息组件
-    for msg in messages:
-        # 检查是否是动作记录
-        if msg.get("is_action_record", False):
-            is_action = True
-            timestamp = msg.get("time")
-            content = msg.get("display_message", "")
+    # 1: 获取发送者信息并提取消息组件
+    for message in messages:
+        if message.is_action_record:
             # 对于动作记录，也处理图片ID
-            content = process_pic_ids(content)
-            message_details_raw.append((timestamp, global_config.bot.nickname, content, is_action))
+            content = process_pic_ids(message.display_message)
+            detailed_messages_raw.append((message.time, message.user_nickname, content, True))
             continue
 
-        # 检查并修复缺少的user_info字段
-        if "user_info" not in msg:
-            # 创建user_info字段
-            msg["user_info"] = {
-                "platform": msg.get("user_platform", ""),
-                "user_id": msg.get("user_id", ""),
-                "user_nickname": msg.get("user_nickname", ""),
-                "user_cardname": msg.get("user_cardname", ""),
-            }
+        platform = message.user_platform
+        user_id = message.user_id
+        user_nickname = message.user_nickname
+        user_cardname = message.user_cardname
 
-        user_info = msg.get("user_info", {})
-        platform = user_info.get("platform")
-        user_id = user_info.get("user_id")
-
-        user_nickname = user_info.get("user_nickname")
-        user_cardname = user_info.get("user_cardname")
-
-        timestamp = msg.get("time")
-        if msg.get("display_message"):
-            content = msg.get("display_message")
-        else:
-            content = msg.get("processed_plain_text", "")  # 默认空字符串
-
-        if "ᶠ" in content:
-            content = content.replace("ᶠ", "")
-        if "ⁿ" in content:
-            content = content.replace("ⁿ", "")
+        timestamp = message.time
+        content = message.display_message or message.processed_plain_text or ""
 
         # 处理图片ID
         if show_pic:
@@ -268,84 +427,34 @@ def _build_readable_messages_internal(
         if not all([platform, user_id, timestamp is not None]):
             continue
 
-        person_id = PersonInfoManager.get_person_id(platform, user_id)
-        person_info_manager = get_person_info_manager()
+        person = Person(platform=platform, user_id=user_id)
         # 根据 replace_bot_name 参数决定是否替换机器人名称
+        person_name = (
+            person.person_name or f"{user_nickname}" or (f"昵称：{user_cardname}" if user_cardname else "某人")
+        )
         if replace_bot_name and user_id == global_config.bot.qq_account:
             person_name = f"{global_config.bot.nickname}(你)"
-        else:
-            person_name = person_info_manager.get_value_sync(person_id, "person_name")
 
-        # 如果 person_name 未设置，则使用消息中的 nickname 或默认名称
-        if not person_name:
-            if user_cardname:
-                person_name = f"昵称：{user_cardname}"
-            elif user_nickname:
-                person_name = f"{user_nickname}"
-            else:
-                person_name = "某人"
+        # 使用独立函数处理用户引用格式
+        if content := replace_user_references(content, platform, replace_bot_name=replace_bot_name):
+            detailed_messages_raw.append((timestamp, person_name, content, False))
 
-        # 检查是否有 回复<aaa:bbb> 字段
-        reply_pattern = r"回复<([^:<>]+):([^:<>]+)>"
-        match = re.search(reply_pattern, content)
-        if match:
-            aaa = match.group(1)
-            bbb = match.group(2)
-            reply_person_id = PersonInfoManager.get_person_id(platform, bbb)
-            reply_person_name = person_info_manager.get_value_sync(reply_person_id, "person_name")
-            if not reply_person_name:
-                reply_person_name = aaa
-            # 在内容前加上回复信息
-            content = re.sub(reply_pattern, lambda m, name=reply_person_name: f"回复 {name}", content, count=1)
-
-        # 检查是否有 @<aaa:bbb> 字段 @<{member_info.get('nickname')}:{member_info.get('user_id')}>
-        at_pattern = r"@<([^:<>]+):([^:<>]+)>"
-        at_matches = list(re.finditer(at_pattern, content))
-        if at_matches:
-            new_content = ""
-            last_end = 0
-            for m in at_matches:
-                new_content += content[last_end : m.start()]
-                aaa = m.group(1)
-                bbb = m.group(2)
-                at_person_id = PersonInfoManager.get_person_id(platform, bbb)
-                at_person_name = person_info_manager.get_value_sync(at_person_id, "person_name")
-                if not at_person_name:
-                    at_person_name = aaa
-                new_content += f"@{at_person_name}"
-                last_end = m.end()
-            new_content += content[last_end:]
-            content = new_content
-
-        target_str = "这是QQ的一个功能，用于提及某人，但没那么明显"
-        if target_str in content:
-            if random.random() < 0.6:
-                content = content.replace(target_str, "")
-
-        if content != "":
-            message_details_raw.append((timestamp, person_name, content, False))
-
-    if not message_details_raw:
+    if not detailed_messages_raw:
         return "", [], pic_id_mapping, current_pic_counter
 
-    message_details_raw.sort(key=lambda x: x[0])  # 按时间戳(第一个元素)升序排序，越早的消息排在前面
+    detailed_messages_raw.sort(key=lambda x: x[0])  # 按时间戳(第一个元素)升序排序，越早的消息排在前面
+    detailed_message: List[Tuple[float, str, str, bool]] = []
 
-    # 为每条消息添加一个标记，指示它是否是动作记录
-    message_details_with_flags = []
-    for timestamp, name, content, is_action in message_details_raw:
-        message_details_with_flags.append((timestamp, name, content, is_action))
-
-    # 应用截断逻辑 (如果 truncate 为 True)
-    message_details: List[Tuple[float, str, str, bool]] = []
-    n_messages = len(message_details_with_flags)
-    if truncate and n_messages > 0:
-        for i, (timestamp, name, content, is_action) in enumerate(message_details_with_flags):
+    # 2. 应用消息截断逻辑
+    messages_count = len(detailed_messages_raw)
+    if truncate and messages_count > 0:
+        for i, (timestamp, name, content, is_action) in enumerate(detailed_messages_raw):
             # 对于动作记录，不进行截断
             if is_action:
-                message_details.append((timestamp, name, content, is_action))
+                detailed_message.append((timestamp, name, content, is_action))
                 continue
 
-            percentile = i / n_messages  # 计算消息在列表中的位置百分比 (0 <= percentile < 1)
+            percentile = i / messages_count  # 计算消息在列表中的位置百分比 (0 <= percentile < 1)
             original_len = len(content)
             limit = -1  # 默认不截断
 
@@ -358,118 +467,49 @@ def _build_readable_messages_internal(
             elif percentile < 0.7:  # 60% 到 80% 之前的消息 (即中间的 20%)
                 limit = 200
                 replace_content = "......（内容太长了）"
-            elif percentile < 1.0:  # 80% 到 100% 之前的消息 (即较新的 20%)
+            elif percentile <= 1.0:  # 80% 到 100% 之前的消息 (即较新的 20%)
                 limit = 400
-                replace_content = "......（太长了）"
+                replace_content = "......（内容太长了）"
 
             truncated_content = content
             if 0 < limit < original_len:
-                truncated_content = f"{content[:limit]}{replace_content}"
+                truncated_content = f"{content[:limit]}{replace_content}"  # pyright: ignore[reportPossiblyUnboundVariable]
 
-            message_details.append((timestamp, name, truncated_content, is_action))
+            detailed_message.append((timestamp, name, truncated_content, is_action))
     else:
         # 如果不截断，直接使用原始列表
-        message_details = message_details_with_flags
+        detailed_message = detailed_messages_raw
 
-    # 3: 合并连续消息 (如果 merge_messages 为 True)
-    merged_messages = []
-    if merge_messages and message_details:
-        # 初始化第一个合并块
-        current_merge = {
-            "name": message_details[0][1],
-            "start_time": message_details[0][0],
-            "end_time": message_details[0][0],
-            "content": [message_details[0][2]],
-            "is_action": message_details[0][3],
-        }
+    # 3: 格式化为字符串
+    output_lines: List[str] = []
 
-        for i in range(1, len(message_details)):
-            timestamp, name, content, is_action = message_details[i]
+    for timestamp, name, content, is_action in detailed_message:
+        readable_time = translate_timestamp_to_human_readable(timestamp, mode=timestamp_mode)
 
-            # 对于动作记录，不进行合并
-            if is_action or current_merge["is_action"]:
-                # 保存当前的合并块
-                merged_messages.append(current_merge)
-                # 创建新的块
-                current_merge = {
-                    "name": name,
-                    "start_time": timestamp,
-                    "end_time": timestamp,
-                    "content": [content],
-                    "is_action": is_action,
-                }
-                continue
+        # 查找消息id（如果有）并构建id_prefix
+        message_id = timestamp_to_id_mapping.get(timestamp, "")
+        id_prefix = f"[{message_id}]" if message_id else ""
 
-            # 如果是同一个人发送的连续消息且时间间隔小于等于60秒
-            if name == current_merge["name"] and (timestamp - current_merge["end_time"] <= 60):
-                current_merge["content"].append(content)
-                current_merge["end_time"] = timestamp  # 更新最后消息时间
-            else:
-                # 保存上一个合并块
-                merged_messages.append(current_merge)
-                # 开始新的合并块
-                current_merge = {
-                    "name": name,
-                    "start_time": timestamp,
-                    "end_time": timestamp,
-                    "content": [content],
-                    "is_action": is_action,
-                }
-        # 添加最后一个合并块
-        merged_messages.append(current_merge)
-    elif message_details:  # 如果不合并消息，则每个消息都是一个独立的块
-        for timestamp, name, content, is_action in message_details:
-            merged_messages.append(
-                {
-                    "name": name,
-                    "start_time": timestamp,  # 起始和结束时间相同
-                    "end_time": timestamp,
-                    "content": [content],  # 内容只有一个元素
-                    "is_action": is_action,
-                }
-            )
-
-    # 4 & 5: 格式化为字符串
-    output_lines = []
-
-    for _i, merged in enumerate(merged_messages):
-        # 使用指定的 timestamp_mode 格式化时间
-        readable_time = translate_timestamp_to_human_readable(merged["start_time"], mode=timestamp_mode)
-
-        # 检查是否是动作记录
-        if merged["is_action"]:
+        if is_action:
             # 对于动作记录，使用特殊格式
-            output_lines.append(f"{readable_time}, {merged['content'][0]}")
+            output_lines.append(f"{id_prefix}{readable_time}, {content}")
         else:
-            header = f"{readable_time}, {merged['name']} :"
-            output_lines.append(header)
-            # 将内容合并，并添加缩进
-            for line in merged["content"]:
-                stripped_line = line.strip()
-                if stripped_line:  # 过滤空行
-                    # 移除末尾句号，添加分号 - 这个逻辑似乎有点奇怪，暂时保留
-                    if stripped_line.endswith("。"):
-                        stripped_line = stripped_line[:-1]
-                    # 如果内容被截断，结尾已经是 ...（内容太长），不再添加分号
-                    if not stripped_line.endswith("（内容太长）"):
-                        output_lines.append(f"{stripped_line}")
-                    else:
-                        output_lines.append(stripped_line)  # 直接添加截断后的内容
+            output_lines.append(f"{id_prefix}{readable_time}, {name}: {content}")
         output_lines.append("\n")  # 在每个消息块后添加换行，保持可读性
 
-    # 移除可能的多余换行，然后合并
     formatted_string = "".join(output_lines).strip()
 
     # 返回格式化后的字符串、消息详情列表、图片映射字典和更新后的计数器
     return (
         formatted_string,
-        [(t, n, c) for t, n, c, is_action in message_details if not is_action],
+        [(t, n, c) for t, n, c, is_action in detailed_message if not is_action],
         pic_id_mapping,
         current_pic_counter,
     )
 
 
 def build_pic_mapping_info(pic_id_mapping: Dict[str, str]) -> str:
+    # sourcery skip: use-contextlib-suppress
     """
     构建图片映射信息字符串，显示图片的具体描述内容
 
@@ -503,10 +543,58 @@ def build_pic_mapping_info(pic_id_mapping: Dict[str, str]) -> str:
     return "\n".join(mapping_lines)
 
 
+def build_readable_actions(actions: List[DatabaseActionRecords], mode: str = "relative") -> str:
+    """
+    将动作列表转换为可读的文本格式。
+    格式: 在（）分钟前，你使用了(action_name)，具体内容是：（action_prompt_display）
+
+    Args:
+        actions: 动作记录字典列表。
+
+    Returns:
+        格式化的动作字符串。
+    """
+    if not actions:
+        return ""
+
+    output_lines = []
+    current_time = time.time()
+
+
+    for action in actions:
+        action_time = action.time or current_time
+        action_name = action.action_name or "未知动作"
+        # action_reason = action.get(action_data")
+        if action_name in ["no_reply", "no_reply"]:
+            continue
+
+        action_prompt_display = action.action_prompt_display or "无具体内容"
+
+        time_diff_seconds = current_time - action_time
+        if mode == "relative":
+            if time_diff_seconds < 60:
+                time_ago_str = f"在{int(time_diff_seconds)}秒前"
+            else:
+                time_diff_minutes = round(time_diff_seconds / 60)
+                time_ago_str = f"在{int(time_diff_minutes)}分钟前"
+        elif mode == "absolute":
+            # 转化为可读时间（仅保留时分秒，不包含日期）
+            action_time_struct = time.localtime(action_time)
+            time_str = time.strftime("%H:%M:%S", action_time_struct)
+            time_ago_str = f"在{time_str}"
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
+
+        line = f"{time_ago_str}，你使用了“{action_name}”，具体内容是：“{action_prompt_display}”"
+        output_lines.append(line)
+ 
+
+    return "\n".join(output_lines)
+
+
 async def build_readable_messages_with_list(
-    messages: List[Dict[str, Any]],
+    messages: List[DatabaseMessages],
     replace_bot_name: bool = True,
-    merge_messages: bool = False,
     timestamp_mode: str = "relative",
     truncate: bool = False,
 ) -> Tuple[str, List[Tuple[float, str, str]]]:
@@ -515,27 +603,60 @@ async def build_readable_messages_with_list(
     允许通过参数控制格式化行为。
     """
     formatted_string, details_list, pic_id_mapping, _ = _build_readable_messages_internal(
-        messages, replace_bot_name, merge_messages, timestamp_mode, truncate
+        [MessageAndActionModel.from_DatabaseMessages(msg) for msg in messages],
+        replace_bot_name,
+        timestamp_mode,
+        truncate,
     )
 
-    # 生成图片映射信息并添加到最前面
-    pic_mapping_info = build_pic_mapping_info(pic_id_mapping)
-    if pic_mapping_info:
+    if pic_mapping_info := build_pic_mapping_info(pic_id_mapping):
         formatted_string = f"{pic_mapping_info}\n\n{formatted_string}"
 
     return formatted_string, details_list
 
 
-def build_readable_messages(
-    messages: List[Dict[str, Any]],
+def build_readable_messages_with_id(
+    messages: List[DatabaseMessages],
     replace_bot_name: bool = True,
-    merge_messages: bool = False,
     timestamp_mode: str = "relative",
     read_mark: float = 0.0,
     truncate: bool = False,
     show_actions: bool = False,
     show_pic: bool = True,
-) -> str:
+    remove_emoji_stickers: bool = False,
+) -> Tuple[str, List[Tuple[str, DatabaseMessages]]]:
+    """
+    将消息列表转换为可读的文本格式，并返回原始(时间戳, 昵称, 内容)列表。
+    允许通过参数控制格式化行为。
+    """
+    message_id_list = assign_message_ids(messages)
+
+    formatted_string = build_readable_messages(
+        messages=messages,
+        replace_bot_name=replace_bot_name,
+        timestamp_mode=timestamp_mode,
+        truncate=truncate,
+        show_actions=show_actions,
+        show_pic=show_pic,
+        read_mark=read_mark,
+        message_id_list=message_id_list,
+        remove_emoji_stickers=remove_emoji_stickers,
+    )
+
+    return formatted_string, message_id_list
+
+
+def build_readable_messages(
+    messages: List[DatabaseMessages],
+    replace_bot_name: bool = True,
+    timestamp_mode: str = "relative",
+    read_mark: float = 0.0,
+    truncate: bool = False,
+    show_actions: bool = False,
+    show_pic: bool = True,
+    message_id_list: Optional[List[Tuple[str, DatabaseMessages]]] = None,
+    remove_emoji_stickers: bool = False,
+) -> str:  # sourcery skip: extract-method
     """
     将消息列表转换为可读的文本格式。
     如果提供了 read_mark，则在相应位置插入已读标记。
@@ -549,17 +670,48 @@ def build_readable_messages(
         read_mark: 已读标记时间戳
         truncate: 是否截断长消息
         show_actions: 是否显示动作记录
+        remove_emoji_stickers: 是否移除表情包并过滤空消息
     """
+    # WIP HERE and BELOW ----------------------------------------------
     # 创建messages的深拷贝，避免修改原始列表
-    copy_messages = [msg.copy() for msg in messages]
+    if not messages:
+        return ""
+
+    # 如果启用移除表情包，先过滤消息
+    if remove_emoji_stickers:
+        filtered_messages = []
+        for msg in messages:
+            # 获取消息内容
+            content = msg.processed_plain_text
+            # 移除表情包
+            emoji_pattern = r"\[表情包：[^\]]+\]"
+            content = re.sub(emoji_pattern, "", content)
+
+            # 如果移除表情包后内容不为空，则保留消息
+            if content.strip():
+                filtered_messages.append(msg)
+
+        messages = filtered_messages
+
+    copy_messages: List[MessageAndActionModel] = []
+    for msg in messages:
+        if remove_emoji_stickers:
+            # 创建 MessageAndActionModel 但移除表情包
+            model = MessageAndActionModel.from_DatabaseMessages(msg)
+            # 移除表情包
+            if model.processed_plain_text:
+                model.processed_plain_text = re.sub(r"\[表情包：[^\]]+\]", "", model.processed_plain_text)
+            copy_messages.append(model)
+        else:
+            copy_messages.append(MessageAndActionModel.from_DatabaseMessages(msg))
 
     if show_actions and copy_messages:
         # 获取所有消息的时间范围
-        min_time = min(msg.get("time", 0) for msg in copy_messages)
-        max_time = max(msg.get("time", 0) for msg in copy_messages)
+        min_time = min(msg.time or 0 for msg in copy_messages)
+        max_time = max(msg.time or 0 for msg in copy_messages)
 
         # 从第一条消息中获取chat_id
-        chat_id = copy_messages[0].get("chat_id") if copy_messages else None
+        chat_id = messages[0].chat_id if messages else None
 
         # 获取这个时间范围内的动作记录，并匹配chat_id
         actions_in_range = (
@@ -579,32 +731,38 @@ def build_readable_messages(
         )
 
         # 合并两部分动作记录
-        actions = list(actions_in_range) + list(action_after_latest)
+        actions: List[ActionRecords] = list(actions_in_range) + list(action_after_latest)
 
         # 将动作记录转换为消息格式
         for action in actions:
             # 只有当build_into_prompt为True时才添加动作记录
             if action.action_build_into_prompt:
-                action_msg = {
-                    "time": action.time,
-                    "user_id": global_config.bot.qq_account,  # 使用机器人的QQ账号
-                    "user_nickname": global_config.bot.nickname,  # 使用机器人的昵称
-                    "user_cardname": "",  # 机器人没有群名片
-                    "processed_plain_text": f"{action.action_prompt_display}",
-                    "display_message": f"{action.action_prompt_display}",
-                    "chat_info_platform": action.chat_info_platform,
-                    "is_action_record": True,  # 添加标识字段
-                    "action_name": action.action_name,  # 保存动作名称
-                }
+                action_msg = MessageAndActionModel(
+                    time=float(action.time),  # type: ignore
+                    user_id=global_config.bot.qq_account,  # 使用机器人的QQ账号
+                    user_platform=global_config.bot.platform,  # 使用机器人的平台
+                    user_nickname=global_config.bot.nickname,  # 使用机器人的用户名
+                    user_cardname="",  # 机器人没有群名片
+                    processed_plain_text=f"{action.action_prompt_display}",
+                    display_message=f"{action.action_prompt_display}",
+                    chat_info_platform=str(action.chat_info_platform),
+                    is_action_record=True,  # 添加标识字段
+                    action_name=str(action.action_name),  # 保存动作名称
+                )
                 copy_messages.append(action_msg)
 
         # 重新按时间排序
-        copy_messages.sort(key=lambda x: x.get("time", 0))
+        copy_messages.sort(key=lambda x: x.time or 0)
 
     if read_mark <= 0:
         # 没有有效的 read_mark，直接格式化所有消息
         formatted_string, _, pic_id_mapping, _ = _build_readable_messages_internal(
-            copy_messages, replace_bot_name, merge_messages, timestamp_mode, truncate, show_pic=show_pic
+            copy_messages,
+            replace_bot_name,
+            timestamp_mode,
+            truncate,
+            show_pic=show_pic,
+            message_id_list=message_id_list,
         )
 
         # 生成图片映射信息并添加到最前面
@@ -615,8 +773,8 @@ def build_readable_messages(
             return formatted_string
     else:
         # 按 read_mark 分割消息
-        messages_before_mark = [msg for msg in copy_messages if msg.get("time", 0) <= read_mark]
-        messages_after_mark = [msg for msg in copy_messages if msg.get("time", 0) > read_mark]
+        messages_before_mark = [msg for msg in copy_messages if (msg.time or 0) <= read_mark]
+        messages_after_mark = [msg for msg in copy_messages if (msg.time or 0) > read_mark]
 
         # 共享的图片映射字典和计数器
         pic_id_mapping = {}
@@ -626,22 +784,22 @@ def build_readable_messages(
         formatted_before, _, pic_id_mapping, pic_counter = _build_readable_messages_internal(
             messages_before_mark,
             replace_bot_name,
-            merge_messages,
             timestamp_mode,
             truncate,
             pic_id_mapping,
             pic_counter,
             show_pic=show_pic,
+            message_id_list=message_id_list,
         )
         formatted_after, _, pic_id_mapping, _ = _build_readable_messages_internal(
             messages_after_mark,
             replace_bot_name,
-            merge_messages,
             timestamp_mode,
             False,
             pic_id_mapping,
             pic_counter,
             show_pic=show_pic,
+            message_id_list=message_id_list,
         )
 
         read_mark_line = "\n--- 以上消息是你已经看过，请关注以下未读的新消息---\n"
@@ -655,9 +813,7 @@ def build_readable_messages(
         # 组合结果
         result_parts = []
         if pic_mapping_info:
-            result_parts.append(pic_mapping_info)
-            result_parts.append("\n")
-
+            result_parts.extend((pic_mapping_info, "\n"))
         if formatted_before and formatted_after:
             result_parts.extend([formatted_before, read_mark_line, formatted_after])
         elif formatted_before:
@@ -670,13 +826,13 @@ def build_readable_messages(
         return "".join(result_parts)
 
 
-async def build_anonymous_messages(messages: List[Dict[str, Any]]) -> str:
+async def build_anonymous_messages(messages: List[DatabaseMessages]) -> str:
     """
     构建匿名可读消息，将不同人的名称转为唯一占位符（A、B、C...），bot自己用SELF。
     处理 回复<aaa:bbb> 和 @<aaa:bbb> 字段，将bbb映射为匿名占位符。
     """
     if not messages:
-        print("111111111111没有消息，无法构建匿名消息")
+        logger.warning("没有消息，无法构建匿名消息")
         return ""
 
     person_map = {}
@@ -714,7 +870,7 @@ async def build_anonymous_messages(messages: List[Dict[str, Any]]) -> str:
             # print("SELF11111111111111")
             return "SELF"
         try:
-            person_id = PersonInfoManager.get_person_id(platform, user_id)
+            person_id = get_person_id(platform, user_id)
         except Exception as _e:
             person_id = None
         if not person_id:
@@ -727,60 +883,24 @@ async def build_anonymous_messages(messages: List[Dict[str, Any]]) -> str:
 
     for msg in messages:
         try:
-            platform = msg.get("chat_info_platform")
-            user_id = msg.get("user_id")
-            _timestamp = msg.get("time")
-            if msg.get("display_message"):
-                content = msg.get("display_message")
-            else:
-                content = msg.get("processed_plain_text", "")
-
-            if "ᶠ" in content:
-                content = content.replace("ᶠ", "")
-            if "ⁿ" in content:
-                content = content.replace("ⁿ", "")
+            platform = msg.chat_info.platform
+            user_id = msg.user_info.user_id
+            content = msg.display_message or msg.processed_plain_text or ""
 
             # 处理图片ID
             content = process_pic_ids(content)
 
-            # if not all([platform, user_id, timestamp is not None]):
-            # continue
-
             anon_name = get_anon_name(platform, user_id)
             # print(f"anon_name:{anon_name}")
 
-            # 处理 回复<aaa:bbb>
-            reply_pattern = r"回复<([^:<>]+):([^:<>]+)>"
-            match = re.search(reply_pattern, content)
-            if match:
-                # print(f"发现回复match:{match}")
-                bbb = match.group(2)
+            # 使用独立函数处理用户引用格式，传入自定义的匿名名称解析器
+            def anon_name_resolver(platform: str, user_id: str) -> str:
                 try:
-                    anon_reply = get_anon_name(platform, bbb)
-                    # print(f"anon_reply:{anon_reply}")
+                    return get_anon_name(platform, user_id)
                 except Exception:
-                    anon_reply = "?"
-                content = re.sub(reply_pattern, f"回复 {anon_reply}", content, count=1)
+                    return "?"
 
-            # 处理 @<aaa:bbb>，无嵌套def
-            at_pattern = r"@<([^:<>]+):([^:<>]+)>"
-            at_matches = list(re.finditer(at_pattern, content))
-            if at_matches:
-                # print(f"发现@match:{at_matches}")
-                new_content = ""
-                last_end = 0
-                for m in at_matches:
-                    new_content += content[last_end : m.start()]
-                    bbb = m.group(2)
-                    try:
-                        anon_at = get_anon_name(platform, bbb)
-                        # print(f"anon_at:{anon_at}")
-                    except Exception:
-                        anon_at = "?"
-                    new_content += f"@{anon_at}"
-                    last_end = m.end()
-                new_content += content[last_end:]
-                content = new_content
+            content = replace_user_references(content, platform, anon_name_resolver, replace_bot_name=False)
 
             header = f"{anon_name}说 "
             output_lines.append(header)
@@ -806,6 +926,203 @@ async def build_anonymous_messages(messages: List[Dict[str, Any]]) -> str:
     return formatted_string
 
 
+def build_readable_messages_anonymized(
+    messages: List[DatabaseMessages],
+    timestamp_mode: str = "relative",
+    show_actions: bool = False,
+    show_pic: bool = True,
+    replace_bot_name: bool = True,
+    remove_emoji_stickers: bool = False,
+) -> Tuple[str, Dict[str, str]]:
+    """
+    仿照 build_readable_messages，构建匿名化的可读消息：
+    - 所有用户名替换为 用户A、用户B、...、用户Z、用户AA、用户AB ...
+    - 内容中的 回复<aaa:bbb> 与 @<aaa:bbb> 也替换为匿名名
+
+    Returns:
+        formatted_string: 格式化后的聊天记录字符串
+        mapping: 原始显示用户名 -> 匿名名 的映射表
+    """
+    if not messages:
+        return "", {}
+
+    # 生成匿名标签：A..Z, AA..AZ, BA.. 等
+    def alphabet_labels() -> Iterable[str]:
+        import string
+
+        letters = string.ascii_uppercase
+        # 单字母
+        for ch in letters:
+            yield ch
+        # 多字母（简单生成两位，若需要可继续扩展）
+        for a in letters:
+            for b in letters:
+                yield f"{a}{b}"
+
+    label_iter = alphabet_labels()
+    user_to_label: Dict[Tuple[str, str], str] = {}
+    name_mapping: Dict[str, str] = {}
+
+    def get_display_name(platform: str, user_id: str, user_nickname: str, user_cardname: Optional[str]) -> str:
+        person = Person(platform=platform, user_id=user_id)
+        return person.person_name or f"{user_nickname}" or (f"昵称：{user_cardname}" if user_cardname else "某人")
+
+    def get_anon_name(platform: str, user_id: str, user_nickname: str, user_cardname: Optional[str]) -> str:
+        key = (platform or "", user_id or "")
+        # 机器人处理：若需要替换机器人名称，则直接返回 昵称(你)
+        if replace_bot_name and user_id == global_config.bot.qq_account:
+            anon = f"{global_config.bot.nickname}(你)"
+            original_display = get_display_name(platform, user_id, user_nickname, user_cardname)
+            if original_display not in name_mapping:
+                name_mapping[original_display] = anon
+            return anon
+        if key not in user_to_label:
+            user_to_label[key] = f"用户{next(label_iter)}"
+        anon = user_to_label[key]
+        # 记录原始显示名到匿名名（可能重复显示名时后写覆盖）
+        original_display = get_display_name(platform, user_id, user_nickname, user_cardname)
+        if original_display not in name_mapping:
+            name_mapping[original_display] = anon
+        return anon
+
+    # 如果启用移除表情包，先过滤消息
+    if remove_emoji_stickers:
+        filtered_messages = []
+        for msg in messages:
+            # 获取消息内容
+            content = msg.display_message or msg.processed_plain_text or ""
+
+            # 移除表情包
+            emoji_pattern = r"\[表情包:[^\]]+\]"
+            content = re.sub(emoji_pattern, "", content)
+
+            # 如果移除表情包后内容不为空，则保留消息
+            if content.strip():
+                filtered_messages.append(msg)
+
+        messages = filtered_messages
+
+    # 将 DatabaseMessages 转换为可处理结构，并可选拼入动作
+    copy_messages: List[MessageAndActionModel] = []
+    for msg in messages:
+        if remove_emoji_stickers:
+            # 创建 MessageAndActionModel 但移除表情包
+            model = MessageAndActionModel.from_DatabaseMessages(msg)
+            # 移除表情包
+            if model.display_message:
+                model.display_message = re.sub(r"\[表情包:[^\]]+\]", "", model.display_message)
+            if model.processed_plain_text:
+                model.processed_plain_text = re.sub(r"\[表情包:[^\]]+\]", "", model.processed_plain_text)
+            copy_messages.append(model)
+        else:
+            copy_messages.append(MessageAndActionModel.from_DatabaseMessages(msg))
+
+    if show_actions and copy_messages:
+        min_time = min(msg.time or 0 for msg in copy_messages)
+        max_time = max(msg.time or 0 for msg in copy_messages)
+        chat_id = messages[0].chat_id if messages else None
+
+        actions_in_range = (
+            ActionRecords.select()
+            .where((ActionRecords.time >= min_time) & (ActionRecords.time <= max_time) & (ActionRecords.chat_id == chat_id))
+            .order_by(ActionRecords.time)
+        )
+        action_after_latest = (
+            ActionRecords.select()
+            .where((ActionRecords.time > max_time) & (ActionRecords.chat_id == chat_id))
+            .order_by(ActionRecords.time)
+            .limit(1)
+        )
+
+        actions: List[ActionRecords] = list(actions_in_range) + list(action_after_latest)
+        for action in actions:
+            if action.action_build_into_prompt:
+                action_msg = MessageAndActionModel(
+                    time=float(action.time),  # type: ignore
+                    user_id=global_config.bot.qq_account,
+                    user_platform=global_config.bot.platform,
+                    user_nickname=global_config.bot.nickname,
+                    user_cardname="",
+                    processed_plain_text=f"{action.action_prompt_display}",
+                    display_message=f"{action.action_prompt_display}",
+                    chat_info_platform=str(action.chat_info_platform),
+                    is_action_record=True,
+                    action_name=str(action.action_name),
+                )
+                copy_messages.append(action_msg)
+
+        copy_messages.sort(key=lambda x: x.time or 0)
+
+    # 图片替换帮助
+    def process_pic_ids(content: Optional[str]) -> str:
+        if content is None:
+            return ""
+        pic_pattern = r"\[picid:([^\]]+)\]"
+
+        def replace_pic_id(_m: re.Match) -> str:
+            return "[图片]" if show_pic else ""
+
+        return re.sub(pic_pattern, replace_pic_id, content)
+
+    # 内容引用替换的 resolver：将 <aaa:bbb> / @<aaa:bbb> 中的 bbb 映射为匿名名
+    def anon_name_resolver(platform: str, user_id: str) -> str:
+        try:
+            # 与主流程一致处理机器人名字
+            if replace_bot_name and user_id == global_config.bot.qq_account:
+                return f"{global_config.bot.nickname}(你)"
+            return get_anon_name(platform, user_id, "", None)
+        except Exception:
+            return "用户?"
+
+    # 构建结果
+    detailed: List[Tuple[float, str, str, bool]] = []
+
+    for m in copy_messages:
+        if m.is_action_record:
+            content = process_pic_ids(m.display_message)
+            detailed.append((m.time or 0.0, "", content, True))
+            continue
+
+        platform = m.user_platform
+        user_id = m.user_id
+        user_nickname = m.user_nickname
+        user_cardname = m.user_cardname
+        content = m.display_message or m.processed_plain_text or ""
+
+        content = process_pic_ids(content)
+        anon_name = get_anon_name(platform, user_id, user_nickname, user_cardname)
+        try:
+            content = replace_user_references(content, platform, anon_name_resolver, replace_bot_name=False)
+        except Exception:
+            pass
+
+        detailed.append((m.time or 0.0, anon_name, content, False))
+
+    if not detailed:
+        return "", name_mapping
+
+    detailed.sort(key=lambda x: x[0])
+
+    output_lines: List[str] = []
+    for ts, name, content, is_action in detailed:
+        readable_time = translate_timestamp_to_human_readable(ts, mode=timestamp_mode)
+        if is_action:
+            output_lines.append(f"{readable_time}, {content}")
+        else:
+            output_lines.append(f"{readable_time}, {name}: {content}")
+        output_lines.append("\n")
+
+    formatted_string = "".join(output_lines).strip()
+
+    # 最后对完整字符串再按映射表做一次替换，处理正文里直接出现的原始昵称
+    if name_mapping:
+        for original_name, anon_name in sorted(name_mapping.items(), key=lambda x: len(x[0]), reverse=True):
+            if original_name:
+                formatted_string = formatted_string.replace(original_name, anon_name)
+
+    return formatted_string, name_mapping
+
+
 async def get_person_id_list(messages: List[Dict[str, Any]]) -> List[str]:
     """
     从消息列表中提取不重复的 person_id 列表 (忽略机器人自身)。
@@ -819,17 +1136,60 @@ async def get_person_id_list(messages: List[Dict[str, Any]]) -> List[str]:
     person_ids_set = set()  # 使用集合来自动去重
 
     for msg in messages:
-        platform = msg.get("user_platform")
-        user_id = msg.get("user_id")
+        platform: str = msg.get("user_platform")  # type: ignore
+        user_id: str = msg.get("user_id")  # type: ignore
 
         # 检查必要信息是否存在 且 不是机器人自己
         if not all([platform, user_id]) or user_id == global_config.bot.qq_account:
             continue
 
-        person_id = PersonInfoManager.get_person_id(platform, user_id)
+        # 添加空值检查，防止 platform 为 None 时出错
+        if platform is None:
+            platform = "unknown"
 
-        # 只有当获取到有效 person_id 时才添加
-        if person_id:
+        if person_id := get_person_id(platform, user_id):
             person_ids_set.add(person_id)
 
     return list(person_ids_set)  # 将集合转换为列表返回
+
+
+async def build_bare_messages(messages: List[DatabaseMessages]) -> str:
+    """
+    构建简化版消息字符串，只包含processed_plain_text内容，不考虑用户名和时间戳
+
+    Args:
+        messages: 消息列表
+
+    Returns:
+        只包含消息内容的字符串
+    """
+    if not messages:
+        return ""
+
+    output_lines = []
+
+    for msg in messages:
+        # 获取纯文本内容
+        content = msg.processed_plain_text or ""
+
+        # 处理图片ID
+        pic_pattern = r"\[picid:[^\]]+\]"
+
+        def replace_pic_id(match):
+            return "[图片]"
+
+        content = re.sub(pic_pattern, replace_pic_id, content)
+
+        # 处理用户引用格式，移除回复和@标记
+        reply_pattern = r"回复<[^:<>]+:[^:<>]+>"
+        content = re.sub(reply_pattern, "回复[某人]", content)
+
+        at_pattern = r"@<[^:<>]+:[^:<>]+>"
+        content = re.sub(at_pattern, "@[某人]", content)
+
+        # 清理并添加到输出
+        content = content.strip()
+        if content:
+            output_lines.append(content)
+
+    return "\n".join(output_lines)
